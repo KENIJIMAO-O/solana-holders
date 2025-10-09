@@ -19,6 +19,7 @@ type TransactionsFilterMap = HashMap<String, SubscribeRequestFilterTransactions>
 type BlocksFilterMap = HashMap<String, SubscribeRequestFilterBlocks>;
 
 /// notice: 我们不在GrpcClient保存一个client，而是对于每一个订阅创建一个新的客户端是因为可能在多进程内各订阅任务导致冲突
+#[derive(Debug, Clone)]
 pub struct GrpcClient {
     endpoint: String,
 }

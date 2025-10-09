@@ -1,12 +1,10 @@
-use std::env;
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-use solana_holders::monitor::client::GrpcClient;
-use solana_holders::monitor::monitor::{Monitor, MonitorConfig, ReConnectConfig, TokenEvent};
+use solana_holders::Server;
 
 #[tokio::main]
 async fn main() {
+    dotenv::dotenv().ok();
+
     let console_subscriber = fmt::layer()
         // .with_target(false)
         // .with_level(false)
@@ -21,23 +19,11 @@ async fn main() {
         )
         .init();
 
-    dotenv::dotenv().ok();
-    let monitor_config = MonitorConfig::new();
-    let rpc_url = env::var("RPC_URL").unwrap();
-    let client = GrpcClient::new(&rpc_url);
-    let (event_sender, event_receiver) = mpsc::unbounded_channel::<TokenEvent>();
-    let re_connect_config = ReConnectConfig::default();
-
-    let mut onchain_monitor = Monitor::new(
-        monitor_config,
-        client,
-        event_sender,
-        re_connect_config,
-    );
-
-    let cancellation_token = CancellationToken::new();
-    let token = cancellation_token.child_token();
-
-
-    let result  = onchain_monitor.run_with_reconnect(token).await;
+    let server = Server {};
+    match server.run().await {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!("server run error: {}", e);
+        }
+    }
 }

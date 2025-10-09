@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use crate::monitor::client::GrpcClient;
+use crate::message_queue::message_queue::Redis;
 use crate::monitor::utils::constant::{TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID_2022};
 use crate::monitor::utils::utils::{convert_to_encoded_tx, subtract_as_decimal, txn_signature_to_string};
 use anyhow::{Error, anyhow};
@@ -8,9 +9,9 @@ use solana_sdk::pubkey::Pubkey;
 use solana_transaction_status_client_types::EncodedTransactionWithStatusMeta;
 use solana_transaction_status_client_types::option_serializer::OptionSerializer;
 use std::env;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use serde::{Deserialize, Serialize};
 use solana_sdk::instruction::CompiledInstruction;
-use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
@@ -19,7 +20,7 @@ use yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof;
 use yellowstone_grpc_proto::tonic::codegen::tokio_stream::StreamExt;
 use spl_token::instruction::TokenInstruction;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum InstructionType {
     Transfer(Pubkey, usize, Pubkey, usize, u64), // source, dest, amount
     TransferChecked(Pubkey, Pubkey, u64, u8), // source, dest, amount, decimal
@@ -30,7 +31,7 @@ pub enum InstructionType {
     Other,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TokenEvent {
     // 唯一标识一个指令
     pub slot: u64,
@@ -72,7 +73,7 @@ impl MonitorConfig {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ReConnectConfig {
     pub reconnect_count: u8,      // 当前的重连次数
     max_reconnect_attempts: u8,   // 最大重连次数
@@ -90,10 +91,12 @@ impl Default for ReConnectConfig {
         }
     }
 }
+
+#[derive(Debug,Clone)]
 pub struct Monitor {
     config: MonitorConfig,
     client: GrpcClient,
-    event_sender: mpsc::UnboundedSender<TokenEvent>,
+    message_queue: Arc<Redis>,
     reconnect_config: ReConnectConfig,
 }
 
@@ -101,13 +104,13 @@ impl Monitor {
     pub fn new(
         config: MonitorConfig,
         client: GrpcClient,
-        event_sender: mpsc::UnboundedSender<TokenEvent>,
+        message_queue: Arc<Redis>,
         reconnect_config: ReConnectConfig,
     ) -> Self {
         Self {
             config,
             client,
-            event_sender,
+            message_queue,
             reconnect_config,
         }
     }
@@ -233,22 +236,19 @@ impl Monitor {
                                         debug!("📦 Slot {}: 开始处理 {} 笔交易", block_slot, tx_count);
 
                                         // 拿到区块之后，要做的一件事情，就是根据交易内容判断是都是符合条件的交易
-                                        let event_sender = self.event_sender.clone();
                                         let tasks: Vec<_> = sub_block.transactions.into_iter().enumerate().map(|(tx_index, tx)|{
                                             let sig = txn_signature_to_string(tx.signature.clone()).unwrap_or_else(|| {
                                                 warn!("Failed to parse transaction signature");
                                                 format!("unknown_{}", tx_index)
                                             });
 
-                                            let event_sender_clone = event_sender.clone();
+                                            let message_queue_clone = self.message_queue.clone();
                                             tokio::spawn(async move {
-                                                let tx_start_time = std::time::Instant::now();
                                                 match convert_to_encoded_tx(tx) {
                                                     Ok(encoded_tx) => {
-                                                        if let Err(e) = Self::process_transaction(encoded_tx, sig, block_slot, event_sender_clone).await {
+                                                        if let Err(e) = Self::process_transaction(encoded_tx, sig, block_slot, message_queue_clone).await {
                                                             error!("Failed to process transaction: {}", e);
                                                         }
-                                                        let tx_duration = tx_start_time.elapsed();
                                                     }
                                                     Err(e) => {
                                                         error!("❌ Failed to convert transaction {}: {:?}", sig, e);
@@ -287,7 +287,7 @@ impl Monitor {
         transaction: EncodedTransactionWithStatusMeta,
         sig: String,
         block_slot: u64,
-        event_sender_clone: mpsc::UnboundedSender<TokenEvent>,
+        message_queue: Arc<Redis>,
     ) -> Result<(), Error> {
         let meta = transaction
             .meta
@@ -385,9 +385,10 @@ impl Monitor {
                             instruction_type: InstructionType::Other, // 简化，不关注具体类型
                             confirmed: false,
                         };
+                        println!("Received TokenEvent: {:?}", token_event);
 
                         // 发送到消息队列
-                        event_sender_clone.send(token_event)?;
+                        let _ = message_queue.batch_queue_holder_event(vec![token_event]).await.unwrap();
                         instruction_index += 1;
                     }
                 }
@@ -467,6 +468,7 @@ impl Monitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message_queue::message_queue::RedisQueueConfig;
 
     #[tokio::test]
     async fn test_monitor() {
@@ -474,21 +476,25 @@ mod tests {
         let monitor_config = MonitorConfig::new();
         let rpc_url = env::var("RPC_URL").unwrap();
         let client = GrpcClient::new(&rpc_url);
-        let (event_sender, event_receiver) = mpsc::unbounded_channel::<TokenEvent>();
+
+        // 创建消息队列
+        let redis_url = std::env::var("REDIS_URL");
+        let config = RedisQueueConfig::default();
+        let message_queue = Redis::new(&redis_url.unwrap(), config).await.unwrap();
+        let _ = message_queue.initialize_message_queue().await.unwrap();
+
         let re_connect_config = ReConnectConfig::default();
 
         let mut onchain_monitor = Monitor::new(
             monitor_config,
             client,
-            event_sender,
+            Arc::new(message_queue),
             re_connect_config,
         );
 
         let cancellation_token = CancellationToken::new();
         let token = cancellation_token.child_token();
 
-
         let result  = onchain_monitor.run_with_reconnect(token).await;
-
     }
 }
