@@ -1,7 +1,7 @@
-use std::time::Duration;
-use sqlx::{PgPool, postgres::PgPoolOptions};
-use tracing::info;
 use anyhow::Error;
+use sqlx::{PgPool, postgres::PgPoolOptions};
+use std::time::Duration;
+use tracing::info;
 
 #[derive(Clone, Debug)]
 pub struct DatabaseConfig {
@@ -12,9 +12,9 @@ pub struct DatabaseConfig {
     pub max_connections: u32,
 
     // 超时配置（单位：秒）
-    pub acquire_timeout: u64,      // 当连接池满时，新请求等待空闲连接的最长时间，超过该时间报错(事务处理的速度)
-    pub idle_timeout: u64,    // 当连接池需要创建数据库连接时，建立TCP连接+PostgreSQL握手的最长时间(连接建立的速度)
-    pub max_lifetime: u64,  // 当连接被归还到连接池时，会测试连接是否仍然有效的最长时间(如果超时则说明当前与数据库建立连接丢失，同时改连接会被丢弃)
+    pub acquire_timeout: u64, // 当连接池满时，新请求等待空闲连接的最长时间，超过该时间报错(事务处理的速度)
+    pub idle_timeout: u64, // 当连接池需要创建数据库连接时，建立TCP连接+PostgreSQL握手的最长时间(连接建立的速度)
+    pub max_lifetime: u64, // 当连接被归还到连接池时，会测试连接是否仍然有效的最长时间(如果超时则说明当前与数据库建立连接丢失，同时改连接会被丢弃)
 }
 
 impl DatabaseConfig {
@@ -44,7 +44,7 @@ impl DatabaseConfig {
 
         // 数据库超时配置常量（秒）
         const DEFAULT_ACQUIRE_TIMEOUT_SECS: u64 = 15;
-        const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 600;  // 10分钟
+        const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 600; // 10分钟
         const DEFAULT_MAX_LIFETIME_SECS: u64 = 3600; // 1小时
 
         // 智能配置辅助函数
@@ -67,7 +67,7 @@ impl DatabaseConfig {
             let heavy_rpc_limit = get_env_or_default("HEAVY_RPC_CONCURRENCY", 15) as u32;
 
             let calculated = (storage_tasks + heavy_rpc_limit + SYSTEM_OVERHEAD_CONNECTIONS)
-                .max(30)  // 最小连接数
+                .max(30) // 最小连接数
                 .min(300); // 最大连接数，避免过度占用数据库资源
 
             info!(
@@ -79,17 +79,16 @@ impl DatabaseConfig {
             max_connections
         };
 
-        let acquire_timeout =  DEFAULT_ACQUIRE_TIMEOUT_SECS;
+        let acquire_timeout = DEFAULT_ACQUIRE_TIMEOUT_SECS;
         let idle_timeout = DEFAULT_IDLE_TIMEOUT_SECS;
         let max_lifetime = DEFAULT_MAX_LIFETIME_SECS;
-
 
         Self {
             database_url,
             max_connections,
             acquire_timeout,
             idle_timeout,
-            max_lifetime
+            max_lifetime,
         }
     }
 }

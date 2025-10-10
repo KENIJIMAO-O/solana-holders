@@ -1,9 +1,9 @@
-use anyhow::{Result, Error, anyhow};
+use crate::monitor::monitor::{InstructionType, TokenEvent};
+use crate::utils::timer::TaskLogger;
+use anyhow::{Error, Result, anyhow};
+use deadpool_redis::{Config, Connection as DeadpoolConnection, Pool, Runtime};
 use redis::{AsyncCommands, Value};
 use tracing::{info, warn};
-use crate::monitor::monitor::{InstructionType, TokenEvent};
-use deadpool_redis::{Config, Pool, Runtime, Connection as DeadpoolConnection};
-
 
 #[derive(Debug, Clone)]
 pub struct RedisQueueConfig {
@@ -20,15 +20,15 @@ impl Default for RedisQueueConfig {
             namespace: "scheduler".to_string(),
             consumer_group: "consumer".to_string(),
             stream_ttl: Some(3600),
-            max_stream_length: 5000,
-            stats_ttl: Some(30 * 24 * 3600),      // 30天TTL
+            max_stream_length: 200000,
+            stats_ttl: Some(30 * 24 * 3600), // 30天TTL
         }
     }
 }
 #[derive(Debug, Clone)]
 pub struct Redis {
     pub queue_connection_pool: Pool, // 消息队列连接池
-    pub redis_queue_config: RedisQueueConfig
+    pub redis_queue_config: RedisQueueConfig,
 }
 
 impl Redis {
@@ -37,7 +37,8 @@ impl Redis {
         // 正确方式：直接将 URL 字符串传给 from_url
         let cfg = Config::from_url(redis_url);
 
-        let pool = cfg.create_pool(Some(Runtime::Tokio1))
+        let pool = cfg
+            .create_pool(Some(Runtime::Tokio1))
             .map_err(|e| anyhow!("Failed to create Deadpool Redis pool: {}", e))?;
 
         info!("✅ [REDIS] Deadpool connection pool created successfully.");
@@ -63,7 +64,10 @@ impl Redis {
         // 尝试创建消费者组，如果stream已存在则忽略错误，否则同时创建stream
         // stream_name 为stream键名
         // consumer_group 要创建的消费组的名称
-        match conn.xgroup_create_mkstream::<_, _, _, String>(&stream_name, &config.consumer_group, "0").await {
+        match conn
+            .xgroup_create_mkstream::<_, _, _, String>(&stream_name, &config.consumer_group, "0")
+            .await
+        {
             Ok(result) => {
                 info!(
                     "✅ [REDIS] Consumer group '{}' created successfully for stream '{}': {}",
@@ -78,8 +82,7 @@ impl Redis {
                         "ℹ️ [REDIS] Consumer group '{}' already exists for stream '{}' - continuing",
                         config.consumer_group, stream_name
                     );
-                }
-                else {
+                } else {
                     // 其他错误需要报告
                     warn!(
                         "⚠️ [REDIS] Failed to create consumer group '{}' for stream '{}': {}",
@@ -97,16 +100,19 @@ impl Redis {
 
     pub async fn batch_queue_holder_event(
         &self,
-        token_events: Vec<TokenEvent>
+        token_events: Vec<TokenEvent>,
+        monitor_logger: &mut TaskLogger,
     ) -> Result<Vec<String>, Error> {
         if token_events.is_empty() {
-            return Err(anyhow!("empty token event"))
+            return Err(anyhow!("empty token event"));
         };
 
+        monitor_logger.log("start to getting a connection");
         let mut conn = self.get_connection().await?;
         let stream_name = &self.redis_queue_config.namespace;
 
         let mut pipe = redis::pipe();
+        monitor_logger.log("start to push stream into pipe");
         for token_event in token_events.clone() {
             // stream_name，即流的键名
             // "*"，告诉redis请自动帮我生成唯一的、有序的ID
@@ -119,16 +125,23 @@ impl Redis {
                     ("ix_idx", token_event.instruction_index.to_string()),
                     ("mint", token_event.mint_address.to_string()),
                     ("account", token_event.account_address.to_string()),
-                    ("owner", token_event.owner_address.map(|o| o.to_string()).unwrap_or_default()),
+                    (
+                        "owner",
+                        token_event
+                            .owner_address
+                            .map(|o| o.to_string())
+                            .unwrap_or_default(),
+                    ),
                     ("delta", token_event.delta),
                     ("ix_type", format!("{:?}", token_event.instruction_type)),
                     ("confirmed", token_event.confirmed.to_string()),
-                ]
+                ],
             );
         }
 
         let results: Vec<String> = pipe.query_async(&mut conn).await?;
 
+        monitor_logger.log("start to batch renew stats");
         // 批量更新统计
         let stats_key = format!("{}:stats:enqueued", stream_name);
         let _: i32 = conn.incr(&stats_key, token_events.len() as i32).await?;
@@ -145,11 +158,14 @@ impl Redis {
         consumer_name: &str,
         max_count: usize,
         block_ms: usize,
+        logger: &mut TaskLogger,
     ) -> Result<Vec<(String, TokenEvent)>, Error> {
+        logger.log("start to getting connection");
         let mut conn = self.get_connection().await?;
         let stream_name = &self.redis_queue_config.namespace;
         let consumer_group = &self.redis_queue_config.consumer_group;
 
+        logger.log("start to batch reading");
         // 使用 XREADGROUP 批量读取消息
         let results: redis::streams::StreamReadReply = redis::cmd("XREADGROUP")
             .arg("GROUP")
@@ -168,6 +184,7 @@ impl Redis {
 
         let mut events = Vec::new();
 
+        logger.log("start to parsing data");
         // 解析 Redis Stream 返回的数据
         for stream_key in results.keys {
             for stream_id in stream_key.ids {
@@ -179,7 +196,10 @@ impl Redis {
                         events.push((message_id, token_event));
                     }
                     Err(e) => {
-                        warn!("⚠️ [REDIS] Failed to parse TokenEvent from message {}: {}", message_id, e);
+                        warn!(
+                            "⚠️ [REDIS] Failed to parse TokenEvent from message {}: {}",
+                            message_id, e
+                        );
                         // 解析失败的消息也要 ACK，避免重复处理
                         let _ = self.ack_message(&message_id).await;
                     }
@@ -187,6 +207,7 @@ impl Redis {
             }
         }
 
+        logger.log("start to renewing statistic");
         // 更新统计
         if !events.is_empty() {
             let stats_key = format!("{}:stats:dequeued", stream_name);
@@ -198,7 +219,6 @@ impl Redis {
 
         Ok(events)
     }
-
 
     /// 确认消息已处理（ACK）
     pub async fn ack_message(&self, message_id: &str) -> Result<(), Error> {
@@ -215,16 +235,19 @@ impl Redis {
     }
 
     fn parse_token_event_from_redis(
-        map: &std::collections::HashMap<String, Value>
+        map: &std::collections::HashMap<String, Value>,
     ) -> Result<TokenEvent, Error> {
+        use redis::FromRedisValue;
         use solana_sdk::pubkey::Pubkey;
-        use std::str::FromStr;
-        use redis::FromRedisValue; // 引入这个 Trait
+        use std::str::FromStr; // 引入这个 Trait
 
         // 辅助函数：从 map 中获取值并解析为目标类型 T
         let get_and_parse = |key: &str| -> Result<String, Error> {
-            let value = map.get(key).ok_or_else(|| anyhow!("Missing field: {}", key))?;
-            String::from_redis_value(value).map_err(|e| anyhow!("Failed to parse {} as String: {}", key, e))
+            let value = map
+                .get(key)
+                .ok_or_else(|| anyhow!("Missing field: {}", key))?;
+            String::from_redis_value(value)
+                .map_err(|e| anyhow!("Failed to parse {} as String: {}", key, e))
         };
 
         // 解析各个字段
@@ -281,7 +304,6 @@ impl Redis {
         }
     }
 
-
     /// 批量确认消息
     pub async fn ack_messages(&self, message_ids: &[String]) -> Result<(), Error> {
         if message_ids.is_empty() {
@@ -301,10 +323,8 @@ impl Redis {
         Ok(())
     }
 
-
     // todo!: 缺少清理PEL函数
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -323,7 +343,7 @@ mod tests {
         let res = match redis.initialize_message_queue().await {
             Ok(_) => {
                 println!("Successfully initialized message queue");
-            },
+            }
             Err(e) => panic!("failed initialized message queue, cause:{:?}", e),
         };
     }

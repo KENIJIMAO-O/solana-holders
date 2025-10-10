@@ -1,7 +1,7 @@
-use anyhow::{Error, Result};
-use std::time::Duration;
-use serde_json::Value;
 use crate::baseline::GetProgramAccountsData;
+use anyhow::{Error, Result};
+use serde_json::Value;
+use std::time::Duration;
 
 #[derive(Debug)] // 使用 Debug trait 方便打印调试
 pub struct TokenHolder {
@@ -59,7 +59,8 @@ impl HttpClient {
             ]
         });
 
-        let response = self.http_client
+        let response = self
+            .http_client
             .post(&self.rpc_url)
             .header("Content-Type", "application/json")
             .json(&request_body)
@@ -70,27 +71,36 @@ impl HttpClient {
         let json_response: serde_json::Value = response.json().await?;
 
         // 提取result字段
-        let result = json_response.get("result")
+        let result = json_response
+            .get("result")
             .ok_or_else(|| anyhow::anyhow!("响应中没有result字段"))?;
 
-        let get_program_accounts_result: GetProgramAccountsData = serde_json::from_value(result.clone())?;
+        let get_program_accounts_result: GetProgramAccountsData =
+            serde_json::from_value(result.clone())?;
         let slot = get_program_accounts_result.context.slot;
         println!("slot: {}", slot);
 
-        let token_holders: Vec<TokenHolder> = get_program_accounts_result.value.into_iter().map(|value_info|
-            TokenHolder {
+        let token_holders: Vec<TokenHolder> = get_program_accounts_result
+            .value
+            .into_iter()
+            .map(|value_info| TokenHolder {
                 slot,
                 mint: value_info.account.data.parsed.info.mint,
                 owner: value_info.account.data.parsed.info.owner,
                 pubkey: value_info.pubkey,
-                balance: value_info.account.data.parsed.info.token_amount.ui_amount_string,
+                balance: value_info
+                    .account
+                    .data
+                    .parsed
+                    .info
+                    .token_amount
+                    .ui_amount_string,
                 decimals: value_info.account.data.parsed.info.token_amount.decimals,
-            }
-        ).collect();
+            })
+            .collect();
         if let Some(first_holder) = token_holders.first() {
             println!("转换后的第一条数据: {:?}", first_holder);
         }
-
 
         // Ok(result) 我不能直接这样返回引用，因为当前引用的值在当前函数结束的时候就已经被释放了，所以返回的时候引用指向空值
         // 有一种情况rust允许函数返回引用，那就是这个返回的值是从函数外部传进来的，同时还得声明其生命周期（第一次具象化感受到了生命周期的作用）
@@ -98,12 +108,11 @@ impl HttpClient {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::fs::File;
     use std::io::Write;
-    use super::*;
 
     #[test]
     fn test_write_file() {

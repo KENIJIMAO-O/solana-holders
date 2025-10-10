@@ -1,29 +1,32 @@
-use std::collections::HashMap;
-use crate::monitor::client::GrpcClient;
 use crate::message_queue::message_queue::Redis;
+use crate::monitor::client::GrpcClient;
 use crate::monitor::utils::constant::{TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID_2022};
-use crate::monitor::utils::utils::{convert_to_encoded_tx, subtract_as_decimal, txn_signature_to_string};
+use crate::monitor::utils::utils::{
+    convert_to_encoded_tx, subtract_as_decimal, txn_signature_to_string,
+};
+use crate::utils::timer::TaskLogger;
 use anyhow::{Error, anyhow};
 use futures::future::join_all;
+use serde::{Deserialize, Serialize};
+use solana_sdk::instruction::CompiledInstruction;
 use solana_sdk::pubkey::Pubkey;
 use solana_transaction_status_client_types::EncodedTransactionWithStatusMeta;
 use solana_transaction_status_client_types::option_serializer::OptionSerializer;
+use spl_token::instruction::TokenInstruction;
+use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
-use serde::{Deserialize, Serialize};
-use solana_sdk::instruction::CompiledInstruction;
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 use yellowstone_grpc_proto::geyser::CommitmentLevel;
 use yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof;
 use yellowstone_grpc_proto::tonic::codegen::tokio_stream::StreamExt;
-use spl_token::instruction::TokenInstruction;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum InstructionType {
     Transfer(Pubkey, usize, Pubkey, usize, u64), // source, dest, amount
-    TransferChecked(Pubkey, Pubkey, u64, u8), // source, dest, amount, decimal
+    TransferChecked(Pubkey, Pubkey, u64, u8),    // source, dest, amount, decimal
     MintTo(),
     MintToChecked(),
     Burn(),
@@ -92,7 +95,7 @@ impl Default for ReConnectConfig {
     }
 }
 
-#[derive(Debug,Clone)]
+#[derive(Debug, Clone)]
 pub struct Monitor {
     config: MonitorConfig,
     client: GrpcClient,
@@ -230,39 +233,9 @@ impl Monitor {
                             if let Some(update) = data.update_oneof{
                                 match update {
                                     UpdateOneof::Block(sub_block) => {
-                                        let block_slot = sub_block.slot;
-                                        let tx_count = sub_block.transactions.len();
-                                        let block_start_time = std::time::Instant::now();
-                                        debug!("📦 Slot {}: 开始处理 {} 笔交易", block_slot, tx_count);
-
-                                        // 拿到区块之后，要做的一件事情，就是根据交易内容判断是都是符合条件的交易
-                                        let tasks: Vec<_> = sub_block.transactions.into_iter().enumerate().map(|(tx_index, tx)|{
-                                            let sig = txn_signature_to_string(tx.signature.clone()).unwrap_or_else(|| {
-                                                warn!("Failed to parse transaction signature");
-                                                format!("unknown_{}", tx_index)
-                                            });
-
-                                            let message_queue_clone = self.message_queue.clone();
-                                            tokio::spawn(async move {
-                                                match convert_to_encoded_tx(tx) {
-                                                    Ok(encoded_tx) => {
-                                                        if let Err(e) = Self::process_transaction(encoded_tx, sig, block_slot, message_queue_clone).await {
-                                                            error!("Failed to process transaction: {}", e);
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        error!("❌ Failed to convert transaction {}: {:?}", sig, e);
-                                                    }
-                                                }
-                                            })
-                                        }).collect();
-
-                                        // 等待所有任务处理完成
-                                        join_all(tasks).await;
-
-                                        let block_duration = block_start_time.elapsed();
-                                        info!("✅ Slot {} 处理完成: 总交易={}, 耗时={}ms",
-                                              block_slot, tx_count, block_duration.as_millis());
+                                        if let Err(e) = self.process_block(sub_block).await {
+                                            error!("Failed to process block: {}", e);
+                                        }
                                     }
                                     _ => {}
                                 }
@@ -282,13 +255,74 @@ impl Monitor {
         Ok(())
     }
 
+    // 处理整个 block，收集所有事件并批量入队
+    // todo!: 要设计一个好的入队算法
+    async fn process_block(
+        &self,
+        sub_block: yellowstone_grpc_proto::geyser::SubscribeUpdateBlock,
+    ) -> Result<(), Error> {
+        let block_slot = sub_block.slot;
+        let tx_count = sub_block.transactions.len();
+        let mut monitor_logger = TaskLogger::new("monitor logger", "1");
+
+        debug!("📦 Slot {}: 开始处理 {} 笔交易", block_slot, tx_count);
+
+        monitor_logger.log("start to handle whole txs in a slot");
+        // 并发处理所有交易
+        let tasks: Vec<_> = sub_block
+            .transactions
+            .into_iter()
+            .enumerate()
+            .map(|(tx_index, tx)| {
+                let sig = txn_signature_to_string(tx.signature.clone()).unwrap_or_else(|| {
+                    warn!("Failed to parse transaction signature");
+                    format!("unknown_{}", tx_index)
+                });
+
+                tokio::spawn(async move {
+                    convert_to_encoded_tx(tx).ok().and_then(|encoded_tx| {
+                        // 使用 block_on 同步执行异步函数
+                        futures::executor::block_on(Self::process_transaction(
+                            encoded_tx,
+                            sig.clone(),
+                            block_slot,
+                        ))
+                        .ok()
+                    })
+                })
+            })
+            .collect();
+
+        // 等待所有任务完成并收集事件
+        let results = join_all(tasks).await;
+        let mut all_events = Vec::new();
+
+        for result in results {
+            if let Ok(Some(events)) = result {
+                all_events.extend(events);
+            }
+        }
+
+        // 批量发送到消息队列
+        monitor_logger.log("start to push events to message queue");
+        if !all_events.is_empty() {
+            let event_count = all_events.len();
+            self.message_queue
+                .batch_queue_holder_event(all_events, &mut monitor_logger)
+                .await?;
+            debug!("✅ Slot {}: 发送 {} 个事件到队列", block_slot, event_count);
+        }
+
+        info!("✅ Slot {} 处理完成: 总交易={}", block_slot, tx_count);
+        Ok(())
+    }
+
     #[instrument(skip_all)]
     async fn process_transaction(
         transaction: EncodedTransactionWithStatusMeta,
         sig: String,
         block_slot: u64,
-        message_queue: Arc<Redis>,
-    ) -> Result<(), Error> {
+    ) -> Result<Vec<TokenEvent>, Error> {
         let meta = transaction
             .meta
             .as_ref()
@@ -296,7 +330,7 @@ impl Monitor {
 
         // 判断当前交易是否成功(如果失败，不做任何动作直接返回)
         if meta.err.is_some() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let tx = transaction
@@ -339,31 +373,28 @@ impl Monitor {
             inner_instructions.as_ref().map_or(0, |ixs| ixs.len())
         );
 
-        // 只有token变化的交易，才有可能改变holder数量
-        if let (
-            OptionSerializer::Some(pre_balances),
-            OptionSerializer::Some(post_balances)
-        ) = (&meta.pre_token_balances, &meta.post_token_balances) {
+        let mut events = Vec::new();
 
+        // 只有token变化的交易，才有可能改变holder数量
+        if let (OptionSerializer::Some(pre_balances), OptionSerializer::Some(post_balances)) =
+            (&meta.pre_token_balances, &meta.post_token_balances)
+        {
             // 创建account_index -> post_balance的映射
-            let post_balance_map: HashMap<u8, _> = post_balances
-                .iter()
-                .map(|b| (b.account_index, b))
-                .collect();
+            let post_balance_map: HashMap<u8, _> =
+                post_balances.iter().map(|b| (b.account_index, b)).collect();
 
             let mut instruction_index = 0u32;
 
             // 直接遍历所有pre_balance，看是否有变化
             for pre_balance in pre_balances {
                 if let Some(post_balance) = post_balance_map.get(&pre_balance.account_index) {
-
                     // 检查余额是否有变化
-                    if pre_balance.ui_token_amount.ui_amount_string !=
-                        post_balance.ui_token_amount.ui_amount_string {
-
+                    if pre_balance.ui_token_amount.ui_amount_string
+                        != post_balance.ui_token_amount.ui_amount_string
+                    {
                         let delta = subtract_as_decimal(
                             &post_balance.ui_token_amount.ui_amount_string,
-                            &pre_balance.ui_token_amount.ui_amount_string
+                            &pre_balance.ui_token_amount.ui_amount_string,
                         )?;
 
                         let owner = match &pre_balance.owner {
@@ -385,17 +416,14 @@ impl Monitor {
                             instruction_type: InstructionType::Other, // 简化，不关注具体类型
                             confirmed: false,
                         };
-                        println!("Received TokenEvent: {:?}", token_event);
-
-                        // 发送到消息队列
-                        let _ = message_queue.batch_queue_holder_event(vec![token_event]).await.unwrap();
+                        events.push(token_event);
                         instruction_index += 1;
                     }
                 }
             }
         }
 
-        Ok(())
+        Ok(events)
     }
 
     pub fn proccess_instruction(
@@ -403,7 +431,7 @@ impl Monitor {
         account_keys: &Vec<Pubkey>,
     ) -> Result<InstructionType, Error> {
         if (ix.program_id_index as usize) > account_keys.len() {
-            return Err(anyhow!("Program ID index out of bounds"))
+            return Err(anyhow!("Program ID index out of bounds"));
         }
 
         let program_id = account_keys[ix.program_id_index as usize];
@@ -417,53 +445,44 @@ impl Monitor {
 
         let account_indexs = &ix.accounts;
         match TokenInstruction::unpack(&ix.data) {
-            Ok(TokenInstruction::Transfer {
-                   amount
-               }) => {
+            Ok(TokenInstruction::Transfer { amount }) => {
                 let source_account_index = account_indexs[0] as usize;
                 let destination_account_index = account_indexs[1] as usize;
 
                 let source_account = account_keys[source_account_index];
                 let destination_account = account_keys[destination_account_index];
-                 Ok(InstructionType::Transfer(source_account, source_account_index, destination_account, destination_account_index, amount))
+                Ok(InstructionType::Transfer(
+                    source_account,
+                    source_account_index,
+                    destination_account,
+                    destination_account_index,
+                    amount,
+                ))
             }
-            Ok(TokenInstruction::TransferChecked {
-                   amount,
-                   decimals,
-               }) => {
+            Ok(TokenInstruction::TransferChecked { amount, decimals }) => {
                 let source_account = account_keys[account_indexs[0] as usize];
                 let destination_account = account_keys[account_indexs[2] as usize];
-                Ok(InstructionType::TransferChecked(source_account, destination_account, amount, decimals))
+                Ok(InstructionType::TransferChecked(
+                    source_account,
+                    destination_account,
+                    amount,
+                    decimals,
+                ))
             }
-            Ok(TokenInstruction::MintTo {
-                amount
-               }) => {
-                 Ok(InstructionType::MintTo())
-            }
+            Ok(TokenInstruction::MintTo { amount }) => Ok(InstructionType::MintTo()),
             Ok(TokenInstruction::MintToChecked {
-                   amount: u64,
-                   decimals: u8,
-               }) => {
-                 Ok(InstructionType::MintToChecked())
-            }
-            Ok(TokenInstruction::Burn {
-                amount
-               }) => {
-                 Ok(InstructionType::Burn())
-            }
+                amount: u64,
+                decimals: u8,
+            }) => Ok(InstructionType::MintToChecked()),
+            Ok(TokenInstruction::Burn { amount }) => Ok(InstructionType::Burn()),
             Ok(TokenInstruction::BurnChecked {
-                   amount: u64,
-                   decimals: u8,
-               }) => {
-                Ok(InstructionType::BurnChecked())
-            }
-            _ => {
-                 Ok(InstructionType::Other)
-            }
+                amount: u64,
+                decimals: u8,
+            }) => Ok(InstructionType::BurnChecked()),
+            _ => Ok(InstructionType::Other),
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -495,6 +514,6 @@ mod tests {
         let cancellation_token = CancellationToken::new();
         let token = cancellation_token.child_token();
 
-        let result  = onchain_monitor.run_with_reconnect(token).await;
+        let result = onchain_monitor.run_with_reconnect(token).await;
     }
 }

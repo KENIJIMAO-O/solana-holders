@@ -1,5 +1,5 @@
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use solana_holders::Server;
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 #[tokio::main]
 async fn main() {

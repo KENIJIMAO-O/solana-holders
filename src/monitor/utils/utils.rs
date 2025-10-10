@@ -114,8 +114,6 @@ fn parse_pubkey(bytes: &[u8]) -> Result<Pubkey, &'static str> {
     Ok(Pubkey::new_from_array(owner_bytes))
 }
 
-
-
 use rust_decimal::Decimal;
 use std::str::FromStr;
 

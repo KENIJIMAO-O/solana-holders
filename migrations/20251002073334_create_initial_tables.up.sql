@@ -7,10 +7,12 @@ CREATE TABLE events (
     mint_pubkey VARCHAR(44),
     account_pubkey VARCHAR(44) NOT NULL,
     owner_pubkey VARCHAR(44),
-    -- 如果 delta 可能超出 64-bit，请使用 NUMERIC(38,0) 或更高精度，
-    -- 否则用 BIGINT 性能和空间更优：
-    delta NUMERIC(38,0),
-    confirmed BOOLEAN NOT NULL DEFAULT FALSE
+    -- 如果 delta 可能超出 64-bit，请使用 NUMERIC(38,12) 或更高精度，
+    -- 38位，小数允许为12位
+    delta NUMERIC(38,12),
+    confirmed BOOLEAN NOT NULL DEFAULT FALSE,
+    -- 唯一性约束，如果不是reset sql，而是add的话，就不是使用这个语句了，应该使用ALTER TABLE
+    CONSTRAINT events_tx_sig_account_pubkey_key UNIQUE (tx_sig, account_pubkey)
 );
 
 -- ===== token_accounts: 每个 account 的当前快照 =====
