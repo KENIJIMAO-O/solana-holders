@@ -174,7 +174,6 @@ impl HttpClient {
         Ok(token_holders)
     }
 
-    /// todo!: 现在遇到一个问题没法解决，就是于owner为TokenProgram2022的spl token好像没有办法获取
     pub async fn get_program_accounts_2022(&self, mint: &str) -> Result<Vec<TokenHolder>, Error> {
         let request_body = serde_json::json!({
                 "jsonrpc": "2.0",
@@ -206,7 +205,6 @@ impl HttpClient {
             .json(&request_body)
             .send()
             .await?;
-
 
         // 解析响应
         let json_response: serde_json::Value = response.json().await?;

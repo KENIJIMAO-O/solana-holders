@@ -6,12 +6,12 @@ use yellowstone_grpc_proto::tonic::async_trait;
 
 pub struct Event {
     pub slot: u64,
-    tx_sig: String,
-    mint_pubkey: String,
+    pub tx_sig: String,
+    pub mint_pubkey: String,
     pub account_pubkey: String,
-    owner_pubkey: String,
+    pub owner_pubkey: String,
     pub delta: Decimal,
-    confirmed: bool,
+    pub confirmed: bool,
 }
 
 impl Event {

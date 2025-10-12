@@ -7,18 +7,18 @@ use yellowstone_grpc_proto::tonic::async_trait;
 
 #[async_trait]
 pub trait TokenAccountsRepository {
-    async fn upsert_token_accounts_batch(
+    async fn establish_token_accounts_baseline(
         &self,
         token_accounts: &[TokenHolder],
         logger: &mut TaskLogger,
     ) -> Result<(), Error>;
 
-    async fn update_token_accounts_batch(&self, token_accounts: &[Event]) -> Result<(), Error>;
+    async fn upsert_token_accounts_batch(&self, token_accounts: &[Event]) -> Result<(), Error>;
 }
 
 #[async_trait]
 impl TokenAccountsRepository for DatabaseConnection {
-    async fn upsert_token_accounts_batch(
+    async fn establish_token_accounts_baseline(
         &self,
         token_accounts: &[TokenHolder],
         logger: &mut TaskLogger,
@@ -72,7 +72,7 @@ impl TokenAccountsRepository for DatabaseConnection {
         Ok(())
     }
 
-    async fn update_token_accounts_batch(&self, events: &[Event]) -> Result<(), Error> {
+    async fn upsert_token_accounts_batch(&self, events: &[Event]) -> Result<(), Error> {
         if events.is_empty() {
             return Ok(());
         }
@@ -87,6 +87,7 @@ impl TokenAccountsRepository for DatabaseConnection {
         let deltas: Vec<String> = events.iter().map(|event| event.delta.to_string()).collect();
         let last_updated_slots: Vec<i64> = events.iter().map(|event| event.slot as i64).collect();
 
+        // todo!: 如果更新之后的balance为0，删除该列数据
         let rows_affected = sqlx::query!(
             r#"
         UPDATE token_accounts AS ta

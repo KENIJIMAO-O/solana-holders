@@ -6,7 +6,7 @@ use yellowstone_grpc_proto::tonic::async_trait;
 #[async_trait]
 pub trait MintStatsRepository {
     /// baseline时使用
-    async fn upsert_mint_stats(
+    async fn establish_mint_stats_baseline(
         &self,
         mint_pubkey: &str,
         holder_count: i64,
@@ -14,7 +14,11 @@ pub trait MintStatsRepository {
     ) -> Result<(), Error>;
 
     /// 监听时更新用户余额
-    async fn update_holder_count();
+    async fn update_mint_stats_holder_count(
+        &self,
+        holder_counts: &[(String, i64)],
+        last_updated_slot: i64,
+    ) -> Result<(), Error>;
 
     /// 获取用户holder account数量
     async fn get_holder_account(&self, mint_pubkey: &str) -> Result<i64, Error>;
@@ -22,7 +26,7 @@ pub trait MintStatsRepository {
 
 #[async_trait]
 impl MintStatsRepository for DatabaseConnection {
-    async fn upsert_mint_stats(
+    async fn establish_mint_stats_baseline(
         &self,
         mint_pubkey: &str,
         holder_count: i64,
@@ -52,8 +56,42 @@ impl MintStatsRepository for DatabaseConnection {
         Ok(())
     }
 
-    async fn update_holder_count() {
-        todo!()
+    //
+    async fn update_mint_stats_holder_count(
+        &self,
+        holder_counts:&[(String, i64)], // 我们要处理全部的数据，而不关注某一个键对应的值时，Vec<()>性能 > HashMap，因为数据在内存中是连续存放的
+        last_updated_slot: i64,
+    ) -> Result<(), Error> {
+        let mut tx = self.pool.begin().await?;
+
+        let (owners_pubkeys, deltas_i64): (Vec<String>, Vec<i64>) = holder_counts
+            .iter()
+            .cloned()
+            .unzip();
+        let deltas: Vec<String> = deltas_i64.iter().map(|d| d.to_string()).collect();
+
+        sqlx::query!(
+            r#"
+        UPDATE holders AS ta
+        SET
+            balance = ta.balance + t.delta::numeric, -- 核心逻辑：累加余额
+            last_updated_slot = $3,
+            updated_at = now()
+        FROM UNNEST($1::varchar[], $2::text[])
+            AS t(owner_pubkey, delta)
+        WHERE
+            ta.owner_pubkey = t.owner_pubkey
+            AND ta.last_updated_slot < $3 -- 同样保留时效性检查
+        "#,
+            &owners_pubkeys,
+            &deltas,
+            &last_updated_slot,
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        Ok(())
     }
 
     async fn get_holder_account(&self, mint_pubkey: &str) -> Result<i64, Error> {

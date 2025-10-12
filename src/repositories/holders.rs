@@ -1,9 +1,10 @@
 use crate::baseline::getProgramAccounts::TokenHolder;
 use crate::database::postgresql::DatabaseConnection;
+use crate::repositories::events::Event;
 use crate::utils::timer::TaskLogger;
 use anyhow::Error;
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use tracing::warn; // 或者你使用的其他日志库
 use yellowstone_grpc_proto::tonic::async_trait;
@@ -62,19 +63,23 @@ fn aggregate_token_holders(token_accounts: &[TokenHolder]) -> Vec<HolderUpsertDa
 #[async_trait]
 pub trait HoldersRepository {
     /// baseline时使用
-    async fn upsert_holders_batch(
+    async fn establish_holders_baseline(
         &self,
         token_accounts: &[TokenHolder],
         logger: &mut TaskLogger,
     ) -> Result<usize, Error>;
 
     /// 监听时更新用户余额
-    async fn update_balance();
+    /// 返回：每个 mint 的 balance > 0 的 holder 数量 HashMap<mint_pubkey, holder_count>
+    async fn upsert_holder_batch(
+        &self,
+        events: &[Event],
+    ) -> Result<Vec<(String, i64)>, Error>;
 }
 
 #[async_trait]
 impl HoldersRepository for DatabaseConnection {
-    async fn upsert_holders_batch(
+    async fn establish_holders_baseline(
         &self,
         token_accounts: &[TokenHolder],
         logger: &mut TaskLogger,
@@ -133,8 +138,78 @@ impl HoldersRepository for DatabaseConnection {
         Ok(holder_account)
     }
 
-    async fn update_balance() {
-        todo!()
+    // 在monitor阶段，接受不断产生的events，去更新数据库中数据
+    // 返回每个 mint 的 balance > 0 的 holder 数量
+    async fn upsert_holder_batch(
+        &self,
+        events: &[Event],
+    ) -> Result<Vec<(String, i64)>, Error> {
+        if events.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // 收集所有需要的字段，包括 mint_pubkey
+        let mint_pubkeys: Vec<String> = events
+            .iter()
+            .map(|event| event.mint_pubkey.clone())
+            .collect();
+        let owner_pubkeys: Vec<String> = events
+            .iter()
+            .map(|event| event.owner_pubkey.clone())
+            .collect();
+        let deltas: Vec<String> = events.iter().map(|event| event.delta.to_string()).collect();
+        let last_updated_slots: Vec<i64> = events.iter().map(|event| event.slot as i64).collect();
+
+        let mut tx = self.pool.begin().await?;
+
+        // 1. 执行 UPSERT 更新余额
+        sqlx::query!(
+            r#"
+            INSERT INTO holders (mint_pubkey, owner_pubkey, balance, last_updated_slot)
+            SELECT mint_pubkey, owner_pubkey, delta::numeric, last_updated_slot
+            FROM UNNEST($1::varchar[], $2::varchar[], $3::text[], $4::bigint[])
+                AS t(mint_pubkey, owner_pubkey, delta, last_updated_slot)
+            ON CONFLICT (mint_pubkey, owner_pubkey)
+            DO UPDATE SET
+                balance = holders.balance + EXCLUDED.balance,  -- 累加余额
+                last_updated_slot = EXCLUDED.last_updated_slot,
+                updated_at = now()
+            WHERE holders.last_updated_slot < EXCLUDED.last_updated_slot  -- 时效性检查
+            "#,
+            &mint_pubkeys,
+            &owner_pubkeys,
+            &deltas,
+            &last_updated_slots,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        // 2. 统计每个 mint 的 holder 数量（balance > 0）
+        let unique_mints: HashSet<String> = events
+            .iter()
+            .map(|event| event.mint_pubkey.clone())
+            .collect();
+
+        let mut holder_counts:Vec<(String, i64)> = Vec::new();
+
+        for mint in unique_mints {
+            let count = sqlx::query_scalar!(
+                r#"
+                SELECT COUNT(*) as "count!"
+                FROM holders
+                WHERE mint_pubkey = $1 AND balance > 0
+                "#,
+                mint
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+
+            holder_counts.push((mint, count));
+        }
+
+        tx.commit().await?; // 提交事务
+
+        Ok(holder_counts)
     }
 }
 

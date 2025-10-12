@@ -96,7 +96,7 @@ impl SyncController {
                             token_event.mint_address.to_string(),
                             token_event.account_address.to_string(),
                             "".to_string(),
-                            delta, 
+                            delta,
                             token_event.confirmed,
                         ),
                         Some(owner_pubkey) => Event::new(
@@ -105,7 +105,7 @@ impl SyncController {
                             token_event.mint_address.to_string(),
                             token_event.account_address.to_string(),
                             owner_pubkey.to_string(),
-                            delta, 
+                            delta,
                             token_event.confirmed,
                         ),
                     };
@@ -117,7 +117,7 @@ impl SyncController {
 
             // 插入到数据库
             if !token_events.is_empty() {
-                let event_count = token_events.len();
+                // 更新events表
                 if let Err(e) = self
                     .database
                     .upsert_events_btach(&token_events, &mut logger)
@@ -126,6 +126,31 @@ impl SyncController {
                     error!("Error upserting events: {}", e);
                     continue;
                 }
+                if let Err(e) = self
+                    .database
+                    .upsert_token_accounts_batch(&token_events)
+                    .await
+                {
+                    error!("upsert token accounts batch failed: {}", e);
+                    continue;
+                }
+                let holder_counts = match self
+                    .database
+                    .upsert_holder_batch(&token_events)
+                    .await
+                {
+                    Ok(h) => h,
+                    Err(e) => {
+                        error!("upsert holder batch failed:{}", e);
+                        return Err(e);
+                    }
+                };
+                let slot = token_events[0].slot;
+                if let Err(e) = self.database.update_mint_stats_holder_count(&holder_counts, slot as i64).await {
+                    error!("Error update mint stats holder count: {}", e);
+                }
+
+                // todo!:更新其他表中数据，且需要区分baseline和监听过程中产生到events表中数据
                 logger.log("sql upsert events complete");
                 // 数据库更改成功之后才能ack
                 if let Err(e) = self.redis.ack_messages(&message_ids).await {
@@ -133,6 +158,7 @@ impl SyncController {
                     continue;
                 }
                 logger.log("redis ack messages complete");
+                let event_count = token_events.len();
                 info!("✅ SyncController: 处理 {} 个事件", event_count);
             }
         }
@@ -148,21 +174,21 @@ impl SyncController {
         if !token_accounts.is_empty() {
             if let Err(e) = self
                 .database
-                .upsert_token_accounts_batch(&token_accounts, &mut logger)
+                .establish_token_accounts_baseline(&token_accounts, &mut logger)
                 .await
             {
-                error!("Error upserting events into token accounts: {}", e);
+                error!("Error establish token accounts baseline: {}", e);
             }
 
             let holder_account = match self
                 .database
-                .upsert_holders_batch(&token_accounts, &mut logger)
+                .establish_holders_baseline(&token_accounts, &mut logger)
                 .await
             {
                 Ok(h) => h,
                 Err(e) => {
-                    error!("Error upserting events into holders: {}", e);
-                    return Err(anyhow::anyhow!(e));
+                    error!("Error establish holders baseline: {}", e);
+                    return Err(e);
                 }
             };
 
@@ -170,10 +196,10 @@ impl SyncController {
 
             if let Err(e) = self
                 .database
-                .upsert_mint_stats(mint, holder_account as i64, last_updated_slot as i64)
+                .establish_mint_stats_baseline(mint, holder_account as i64, last_updated_slot as i64)
                 .await
             {
-                error!("Error upserting events into mint stats: {}", e);
+                error!("establish mint stats baseline: {}", e);
             }
         }
         Ok(())
