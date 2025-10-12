@@ -1,3 +1,4 @@
+use crate::baseline::getProgramAccounts::HttpClient;
 use crate::database::postgresql::{DatabaseConfig, DatabaseConnection};
 use crate::message_queue::message_queue::{Redis, RedisQueueConfig};
 use crate::monitor::client::GrpcClient;
@@ -56,7 +57,12 @@ impl Server {
         let db_url = std::env::var("DATABASE_URL").unwrap();
         let database_config = DatabaseConfig::new_optimized(db_url);
         let database = Arc::new(DatabaseConnection::new(database_config).await.unwrap());
-        let sync_controller = SyncController::new(message_queue.clone(), database.clone());
+
+        let http_rpc = std::env::var("RPC_URL").unwrap();
+        let http_client = Arc::new(HttpClient::new(http_rpc).unwrap());
+
+        let sync_controller =
+            SyncController::new(message_queue.clone(), database.clone(), http_client.clone());
         let sync_controller = {
             let mut sync_controller = sync_controller.clone();
             let token = cancellation_token.child_token();

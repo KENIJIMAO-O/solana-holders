@@ -20,7 +20,7 @@ CREATE TABLE token_accounts (
     acct_pubkey VARCHAR(44) PRIMARY KEY,     -- 若固定长度建议 VARCHAR(n)
     mint_pubkey VARCHAR(44) NOT NULL,
     owner_pubkey VARCHAR(44) NOT NULL,
-    balance NUMERIC(38,0) NOT NULL,          -- 若可用 BIGINT 建议改为 BIGINT
+    balance NUMERIC(38,12) NOT NULL,          -- 若可用 BIGINT 建议改为 BIGINT
     last_updated_slot BIGINT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -34,7 +34,7 @@ CREATE INDEX idx_token_accounts_owner_pubkey ON token_accounts (owner_pubkey);
 CREATE TABLE holders (
     mint_pubkey VARCHAR(44) NOT NULL,
     owner_pubkey VARCHAR(44) NOT NULL,
-    balance NUMERIC(38,0) NOT NULL,
+    balance NUMERIC(38,12) NOT NULL,
     last_updated_slot BIGINT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (mint_pubkey, owner_pubkey)

@@ -3,6 +3,37 @@ use serde::Deserialize;
 pub mod getProgramAccounts;
 
 #[derive(Deserialize, Debug)]
+pub struct GetAccountInfoData {
+    pub jsonrpc: String,
+    pub result: AccountInfoResult,
+    pub id: u64,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct AccountInfoResult {
+    pub context: AccountInfoContextInfo,
+    pub value: AccountInfoValue,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountInfoContextInfo {
+    pub api_version: String,
+    pub slot: u64,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountInfoValue {
+    pub data: Vec<String>, // ["", "base58"] 格式
+    pub executable: bool,
+    pub lamports: u64,
+    pub owner: String,
+    pub rent_epoch: u64,
+    pub space: u64,
+}
+
+#[derive(Deserialize, Debug)]
 pub struct GetProgramAccountsData {
     context: ContextInfo,
     value: Vec<ValueInfo>,

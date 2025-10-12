@@ -1,6 +1,10 @@
+use crate::baseline::getProgramAccounts::HttpClient;
 use crate::database::postgresql::DatabaseConnection;
 use crate::message_queue::message_queue::Redis;
 use crate::repositories::events::{Event, EventsRepository};
+use crate::repositories::holders::HoldersRepository;
+use crate::repositories::mint_stats::MintStatsRepository;
+use crate::repositories::token_accounts::TokenAccountsRepository;
 use crate::utils::timer::TaskLogger;
 use rust_decimal::Decimal;
 use std::sync::Arc;
@@ -12,11 +16,21 @@ use tracing::{error, info};
 pub struct SyncController {
     pub redis: Arc<Redis>,
     pub database: Arc<DatabaseConnection>,
+    pub http_client: Arc<HttpClient>,
 }
 
+/// todo!: 还有一比较关键的东西没做，就是需要判断一下消息队列的发送端和接收端处理的时候是否需要用到锁
 impl SyncController {
-    pub fn new(redis: Arc<Redis>, database: Arc<DatabaseConnection>) -> Self {
-        Self { redis, database }
+    pub fn new(
+        redis: Arc<Redis>,
+        database: Arc<DatabaseConnection>,
+        http_client: Arc<HttpClient>,
+    ) -> Self {
+        Self {
+            redis,
+            database,
+            http_client,
+        }
     }
 
     pub async fn start(&self, cancellation_token: CancellationToken) -> anyhow::Result<()> {
@@ -82,7 +96,7 @@ impl SyncController {
                             token_event.mint_address.to_string(),
                             token_event.account_address.to_string(),
                             "".to_string(),
-                            delta, // <-- 使用我们安全解析出来的 Decimal
+                            delta, 
                             token_event.confirmed,
                         ),
                         Some(owner_pubkey) => Event::new(
@@ -91,7 +105,7 @@ impl SyncController {
                             token_event.mint_address.to_string(),
                             token_event.account_address.to_string(),
                             owner_pubkey.to_string(),
-                            delta, // <-- 使用我们安全解析出来的 Decimal
+                            delta, 
                             token_event.confirmed,
                         ),
                     };
@@ -120,6 +134,46 @@ impl SyncController {
                 }
                 logger.log("redis ack messages complete");
                 info!("✅ SyncController: 处理 {} 个事件", event_count);
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn build_baseline(&self, mint: &str) -> anyhow::Result<()> {
+        // todo!: 构建baseline的时候只需要插入进行，后续监听合并的过程会有对token account balance的大量更新，而不是插入
+        let token_accounts = self.http_client.get_token_holders(mint).await?;
+
+        let mut logger = TaskLogger::new("baseline", "3");
+
+        if !token_accounts.is_empty() {
+            if let Err(e) = self
+                .database
+                .upsert_token_accounts_batch(&token_accounts, &mut logger)
+                .await
+            {
+                error!("Error upserting events into token accounts: {}", e);
+            }
+
+            let holder_account = match self
+                .database
+                .upsert_holders_batch(&token_accounts, &mut logger)
+                .await
+            {
+                Ok(h) => h,
+                Err(e) => {
+                    error!("Error upserting events into holders: {}", e);
+                    return Err(anyhow::anyhow!(e));
+                }
+            };
+
+            let last_updated_slot = token_accounts[0].slot;
+
+            if let Err(e) = self
+                .database
+                .upsert_mint_stats(mint, holder_account as i64, last_updated_slot as i64)
+                .await
+            {
+                error!("Error upserting events into mint stats: {}", e);
             }
         }
         Ok(())

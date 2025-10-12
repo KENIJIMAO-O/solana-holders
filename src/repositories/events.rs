@@ -5,12 +5,12 @@ use rust_decimal::Decimal;
 use yellowstone_grpc_proto::tonic::async_trait;
 
 pub struct Event {
-    slot: u64,
+    pub slot: u64,
     tx_sig: String,
     mint_pubkey: String,
-    account_pubkey: String,
+    pub account_pubkey: String,
     owner_pubkey: String,
-    delta: Decimal,
+    pub delta: Decimal,
     confirmed: bool,
 }
 
