@@ -73,12 +73,15 @@ impl TokenAccountsRepository for DatabaseConnection {
     }
 
     async fn upsert_token_accounts_batch(&self, events: &[Event]) -> Result<(), Error> {
+        // 1.empty check
         if events.is_empty() {
             return Ok(());
         }
 
+        // 2.get pool connection
         let mut tx = self.pool.begin().await?;
 
+        // 3.parse data
         let account_pubkeys: Vec<String> = events
             .iter()
             .map(|event| event.account_pubkey.clone())
@@ -87,7 +90,8 @@ impl TokenAccountsRepository for DatabaseConnection {
         let deltas: Vec<String> = events.iter().map(|event| event.delta.to_string()).collect();
         let last_updated_slots: Vec<i64> = events.iter().map(|event| event.slot as i64).collect();
 
-        // todo!: 如果更新之后的balance为0，删除该列数据
+        // todo!: 其实这里还有一个地方有难搞，就是如果在baseline之后出现新的token_account咋办
+        // 4.这个地方目前只是update，但是感觉肯定是会变成upsert
         let rows_affected = sqlx::query!(
             r#"
         UPDATE token_accounts AS ta
@@ -108,6 +112,17 @@ impl TokenAccountsRepository for DatabaseConnection {
         .execute(&mut *tx)
         .await?
         .rows_affected(); // 获取受影响的行数
+
+        // 删除上述账户中余额为0的数据
+        let delete_result = sqlx::query!(
+            r#"
+        DELETE FROM token_accounts
+        WHERE balance = 0 AND acct_pubkey = ANY($1)
+        "#,
+            &account_pubkeys,
+        )
+        .execute(&mut *tx)
+        .await?;
 
         tx.commit().await?;
         Ok(())

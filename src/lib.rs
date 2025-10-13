@@ -68,9 +68,10 @@ impl Server {
             let token = cancellation_token.child_token();
             tokio::spawn(async move {
                 debug!("[-] Starting sync controller...");
-                if let Err(e) = sync_controller.start(token).await {
+                if let Err(e) = sync_controller.consume_events_from_queue(token).await {
                     error!("Monitor error: {:?}", e);
                 }
+
                 debug!("Monitor completed");
             })
         };

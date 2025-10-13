@@ -10,7 +10,7 @@ use tracing::info;
 
 #[derive(Debug, Deserialize, Serialize)] // 使用 Debug trait 方便打印调试
 pub struct TokenHolder {
-    pub slot: u64,
+    pub slot: i64,
     pub mint: String,    // token address
     pub owner: String,   // token holder
     pub pubkey: String,  // token account
@@ -287,7 +287,7 @@ mod tests {
         let rpc_url = std::env::var("RPC_URL").unwrap();
         let http_client = HttpClient::new(rpc_url).unwrap();
 
-        let mint = "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3";
+        let mint = "DrZ26cKJDksVRWib3DVVsjo9eeXccc7hKhDJviiYEEZY";
         let res = http_client.get_program_accounts(mint).await;
 
         let path = "getProgramAccounts.json";

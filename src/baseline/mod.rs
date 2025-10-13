@@ -43,7 +43,7 @@ pub struct GetProgramAccountsData {
 #[serde(rename_all = "camelCase")]
 pub struct ContextInfo {
     api_version: String,
-    slot: u64,
+    slot: i64,
 }
 
 #[derive(Deserialize, Debug)]

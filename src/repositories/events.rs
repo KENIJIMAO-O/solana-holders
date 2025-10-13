@@ -1,11 +1,24 @@
 use crate::database::postgresql::DatabaseConnection;
 use crate::utils::timer::TaskLogger;
-use anyhow::{Error, Result};
+use anyhow::{Error, Result, anyhow};
 use rust_decimal::Decimal;
+use sqlx::FromRow;
 use yellowstone_grpc_proto::tonic::async_trait;
 
 pub struct Event {
-    pub slot: u64,
+    pub slot: i64,
+    pub tx_sig: String,
+    pub mint_pubkey: String,
+    pub account_pubkey: String,
+    pub owner_pubkey: String,
+    pub delta: Decimal,
+    pub confirmed: bool,
+}
+
+#[derive(FromRow)]
+struct EventFromDb {
+    pub id: i64,
+    pub slot: i64,
     pub tx_sig: String,
     pub mint_pubkey: String,
     pub account_pubkey: String,
@@ -16,7 +29,7 @@ pub struct Event {
 
 impl Event {
     pub fn new(
-        slot: u64,
+        slot: i64,
         tx_sig: String,
         mint_pubkey: String,
         account_pubkey: String,
@@ -39,7 +52,7 @@ impl Event {
 #[async_trait]
 pub trait EventsRepository {
     /// 批量插入或者更新
-    async fn upsert_events_btach(
+    async fn upsert_events_batch(
         &self,
         events: &[Event],
         logger: &mut TaskLogger,
@@ -48,11 +61,21 @@ pub trait EventsRepository {
     /// 更新confirmed
     async fn confirm_events(&self, events: &[Event]) -> Result<(), Error>;
     // todo!:更多的repo
+
+    /// 从指定的游标 (last_slot, last_id) 开始，获取下一批最新的 events
+    async fn get_next_events_batch(
+        &self,
+        cursor: (i64, i64), // 游标现在是一个元组
+        mint: &str,
+        limit: i64,
+    ) -> Result<(Vec<Event>, Option<(i64, i64)>), Error>;
+
+    async fn get_latest_event_slot(&self) -> Result<i64>;
 }
 
 #[async_trait]
 impl EventsRepository for DatabaseConnection {
-    async fn upsert_events_btach(
+    async fn upsert_events_batch(
         &self,
         events: &[Event],
         logger: &mut TaskLogger,
@@ -119,5 +142,61 @@ impl EventsRepository for DatabaseConnection {
 
     async fn confirm_events(&self, events: &[Event]) -> Result<(), Error> {
         todo!()
+    }
+
+    /// 从指定的游标 (last_slot, last_id) 开始，获取下一批最新的 events
+    async fn get_next_events_batch(
+        &self,
+        cursor: (i64, i64), // 游标现在是一个元组
+        mint: &str,
+        limit: i64,
+    ) -> Result<(Vec<Event>, Option<(i64, i64)>), Error> {
+        let (last_slot, last_id) = cursor;
+
+        // 1. 查询数据库时，使用内部的 EventFromDb 结构体来接收数据
+        let events_from_db: Vec<EventFromDb> = sqlx::query_as!(
+            EventFromDb, // <--- 使用内部专用的结构体
+            r#"
+        SELECT id, slot, tx_sig, mint_pubkey, account_pubkey, owner_pubkey, delta, confirmed
+        FROM events
+        WHERE (slot, id) > ($1, $2) AND mint_pubkey = $3
+        ORDER BY slot ASC, id ASC
+        LIMIT $4
+        "#,
+            last_slot,
+            last_id,
+            mint,
+            limit
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        // 2. 确定下一次查询的新游标
+        // 如果 next_cursor 返回Null，则意味着 数据库中已经没有符合条件的数据要取出来了，说明取完了
+        let next_cursor = events_from_db
+            .last() // 如果数据不为空，返回最后一个元素，否则返回Null
+            .map(|last_event| (last_event.slot, last_event.id));
+
+        // 3. 将包含 id 的数据库模型转换为不含 id 的通用业务模型
+        let events: Vec<Event> = events_from_db
+            .into_iter()
+            .map(|db_event| Event {
+                // 手动转换
+                slot: db_event.slot,
+                tx_sig: db_event.tx_sig,
+                mint_pubkey: db_event.mint_pubkey,
+                account_pubkey: db_event.account_pubkey,
+                owner_pubkey: db_event.owner_pubkey,
+                delta: db_event.delta,
+                confirmed: db_event.confirmed,
+            })
+            .collect();
+
+        // 4. 返回包含两个元素的元组
+        Ok((events, next_cursor))
+    }
+
+    async fn get_latest_event_slot(&self) -> Result<i64> {
+        Ok(1)
     }
 }

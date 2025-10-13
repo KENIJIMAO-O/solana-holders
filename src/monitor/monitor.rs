@@ -37,7 +37,7 @@ pub enum InstructionType {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TokenEvent {
     // 唯一标识一个指令
-    pub slot: u64,
+    pub slot: i64,
     pub tx_signature: String,
     pub instruction_index: u32,
 
@@ -285,7 +285,7 @@ impl Monitor {
                         futures::executor::block_on(Self::process_transaction(
                             encoded_tx,
                             sig.clone(),
-                            block_slot,
+                            block_slot as i64,
                         ))
                         .ok()
                     })
@@ -299,21 +299,29 @@ impl Monitor {
 
         for result in results {
             if let Ok(Some(events)) = result {
+                println!("token_events: {:?}", events);
                 all_events.extend(events);
             }
         }
 
         // 批量发送到消息队列
         monitor_logger.log("start to push events to message queue");
-        if !all_events.is_empty() {
-            let event_count = all_events.len();
-            self.message_queue
-                .batch_queue_holder_event(all_events, &mut monitor_logger)
-                .await?;
-            debug!("✅ Slot {}: 发送 {} 个事件到队列", block_slot, event_count);
-        }
+        // self.send_events_to_message_queue(all_events, &mut monitor_logger).await?;
 
         info!("✅ Slot {} 处理完成: 总交易={}", block_slot, tx_count);
+        Ok(())
+    }
+
+    async fn send_events_to_message_queue(
+        &self,
+        all_events: Vec<TokenEvent>,
+        monitor_logger: &mut TaskLogger,
+    ) -> anyhow::Result<()> {
+        if !all_events.is_empty() {
+            self.message_queue
+                .batch_queue_holder_event(all_events, monitor_logger)
+                .await?;
+        }
         Ok(())
     }
 
@@ -321,7 +329,7 @@ impl Monitor {
     async fn process_transaction(
         transaction: EncodedTransactionWithStatusMeta,
         sig: String,
-        block_slot: u64,
+        block_slot: i64,
     ) -> Result<Vec<TokenEvent>, Error> {
         let meta = transaction
             .meta
@@ -487,6 +495,7 @@ impl Monitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::baseline::getProgramAccounts::HttpClient;
     use crate::message_queue::message_queue::RedisQueueConfig;
 
     #[tokio::test]
@@ -515,5 +524,39 @@ mod tests {
         let token = cancellation_token.child_token();
 
         let result = onchain_monitor.run_with_reconnect(token).await;
+    }
+
+    #[tokio::test]
+    async fn test_monitor_get_token_holders() {
+        dotenv::dotenv().ok();
+        let monitor_config = MonitorConfig::new();
+        let rpc_url = env::var("RPC_URL").unwrap();
+        let client = GrpcClient::new(&rpc_url);
+
+        // 创建消息队列
+        let redis_url = std::env::var("REDIS_URL");
+        let config = RedisQueueConfig::default();
+        let message_queue = Redis::new(&redis_url.unwrap(), config).await.unwrap();
+        let _ = message_queue.initialize_message_queue().await.unwrap();
+
+        let re_connect_config = ReConnectConfig::default();
+
+        let mut onchain_monitor = Monitor::new(
+            monitor_config,
+            client,
+            Arc::new(message_queue),
+            re_connect_config,
+        );
+
+        let cancellation_token = CancellationToken::new();
+        let token = cancellation_token.child_token();
+
+        onchain_monitor.run_with_reconnect(token).await;
+
+        let rpc_url = std::env::var("RPC_URL").unwrap();
+        let http_client = HttpClient::new(rpc_url).unwrap();
+
+        let mint = "DrZ26cKJDksVRWib3DVVsjo9eeXccc7hKhDJviiYEEZY";
+        let res = http_client.get_program_accounts(mint).await;
     }
 }

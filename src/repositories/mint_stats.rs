@@ -59,15 +59,13 @@ impl MintStatsRepository for DatabaseConnection {
     //
     async fn update_mint_stats_holder_count(
         &self,
-        holder_counts:&[(String, i64)], // 我们要处理全部的数据，而不关注某一个键对应的值时，Vec<()>性能 > HashMap，因为数据在内存中是连续存放的
+        holder_counts: &[(String, i64)], // 我们要处理全部的数据，而不关注某一个键对应的值时，Vec<()>性能 > HashMap，因为数据在内存中是连续存放的
         last_updated_slot: i64,
     ) -> Result<(), Error> {
         let mut tx = self.pool.begin().await?;
 
-        let (owners_pubkeys, deltas_i64): (Vec<String>, Vec<i64>) = holder_counts
-            .iter()
-            .cloned()
-            .unzip();
+        let (owners_pubkeys, deltas_i64): (Vec<String>, Vec<i64>) =
+            holder_counts.iter().cloned().unzip();
         let deltas: Vec<String> = deltas_i64.iter().map(|d| d.to_string()).collect();
 
         sqlx::query!(

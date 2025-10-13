@@ -15,7 +15,7 @@ pub struct HolderUpsertData {
     pub mint_pubkey: String,
     pub owner_pubkey: String,
     pub balance: Decimal,
-    pub last_updated_slot: u64,
+    pub last_updated_slot: i64,
 }
 
 /// 将 TokenHolder 列表按 (mint, owner) 分组，并聚合余额和 slot
@@ -71,10 +71,7 @@ pub trait HoldersRepository {
 
     /// 监听时更新用户余额
     /// 返回：每个 mint 的 balance > 0 的 holder 数量 HashMap<mint_pubkey, holder_count>
-    async fn upsert_holder_batch(
-        &self,
-        events: &[Event],
-    ) -> Result<Vec<(String, i64)>, Error>;
+    async fn upsert_holder_batch(&self, events: &[Event]) -> Result<Vec<(String, i64)>, Error>;
 }
 
 #[async_trait]
@@ -140,10 +137,7 @@ impl HoldersRepository for DatabaseConnection {
 
     // 在monitor阶段，接受不断产生的events，去更新数据库中数据
     // 返回每个 mint 的 balance > 0 的 holder 数量
-    async fn upsert_holder_batch(
-        &self,
-        events: &[Event],
-    ) -> Result<Vec<(String, i64)>, Error> {
+    async fn upsert_holder_batch(&self, events: &[Event]) -> Result<Vec<(String, i64)>, Error> {
         if events.is_empty() {
             return Ok(vec![]);
         }
@@ -184,13 +178,27 @@ impl HoldersRepository for DatabaseConnection {
         .execute(&mut *tx)
         .await?;
 
+        let delete_result = sqlx::query!(
+            r#"
+      DELETE FROM holders AS h
+      USING UNNEST($1::varchar[], $2::varchar[]) AS t(mint_pubkey, owner_pubkey)
+      WHERE h.mint_pubkey = t.mint_pubkey
+        AND h.owner_pubkey = t.owner_pubkey
+        AND h.balance = 0
+      "#,
+            &mint_pubkeys,
+            &owner_pubkeys
+        )
+        .execute(&mut *tx)
+        .await?;
+
         // 2. 统计每个 mint 的 holder 数量（balance > 0）
         let unique_mints: HashSet<String> = events
             .iter()
             .map(|event| event.mint_pubkey.clone())
             .collect();
 
-        let mut holder_counts:Vec<(String, i64)> = Vec::new();
+        let mut holder_counts: Vec<(String, i64)> = Vec::new();
 
         for mint in unique_mints {
             let count = sqlx::query_scalar!(

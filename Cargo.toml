@@ -26,7 +26,7 @@ rust_decimal = { version = "1.35", features = ["serde-str"] }
 #数据库
 redis = { version = "0.32.6", features = ["tokio-comp"] }
 deadpool-redis = "0.22.0"
-sqlx = { version = "0.8.6",features = ["postgres", "runtime-tokio-rustls","macros","chrono", "bigdecimal"]}
+sqlx = { version = "0.8.6",features = ["postgres", "runtime-tokio-rustls","macros","chrono", "rust_decimal"]}
 
 # solana链上交互
 solana-client = "2.2.7"
