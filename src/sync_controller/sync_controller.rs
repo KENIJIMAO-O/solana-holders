@@ -1,10 +1,11 @@
 use crate::baseline::getProgramAccounts::HttpClient;
 use crate::database::postgresql::DatabaseConnection;
-use crate::message_queue::message_queue::Redis;
+use crate::message_queue::token_event_message_queue::Redis;
 use crate::repositories::events::{Event, EventsRepository};
 use crate::repositories::holders::HoldersRepository;
 use crate::repositories::mint_stats::MintStatsRepository;
 use crate::repositories::token_accounts::TokenAccountsRepository;
+use crate::repositories::tracked_mints::TrackedMintsRepository;
 use crate::utils::timer::TaskLogger;
 use rust_decimal::Decimal;
 use std::sync::Arc;
@@ -45,14 +46,13 @@ impl SyncController {
             let mut logger = TaskLogger::new("sync_controller", "2");
 
             // 使用 tokio::select! 来并发地监听“取消信号”和“出队操作”
+            // 该宏允许你同时等待多个不同的异步操作，并且在其中任意一个结束后立即执行相应的代码块
             tokio::select! {
                 // 分支 1: 如果收到了取消信号
                 _ = cancellation_token.cancelled() => {
                     info!("Monitor received cancellation signal. Shutting down...");
                     break; // 跳出 loop 循环，函数将优雅地结束
                 }
-
-                // todo!: 这里要干的一件事情就是将新出现的token，进行baseline构建，所以需要一张新表
 
                 // 分支 2: 执行出队操作
                 datas_result = self.redis.batch_dequeue_holder_event(
@@ -70,6 +70,7 @@ impl SyncController {
                         }
                     };
 
+                    // 如果为空，说明数据还没进队
                     if datas.is_empty() {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                         continue;
@@ -110,8 +111,17 @@ impl SyncController {
                         })
                         .unzip();
 
+                    // todo!: 这里要干的一件事情就是将新出现的token，进行baseline构建，所以需要一张新表
+                    // 构建baseline
+                    let mints: Vec<String> = token_events
+                        .iter()
+                        .map(|token_event| token_event.mint_pubkey.clone())
+                        .collect();
+                    let untracked_mints = self.database.is_tracked_batch(&mints).await?;
 
-                    // --- 核心职责：将清洗后的数据存入 events 表 ---
+
+
+                    // --- 核心职责：将新的数据更新到数据库中 ---
                     if !token_events.is_empty() {
                         // 只更新 events 表
                         if let Err(e) = self.database.upsert_events_batch(&token_events, &mut logger).await {

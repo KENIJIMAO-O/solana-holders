@@ -1,4 +1,4 @@
-use crate::message_queue::message_queue::Redis;
+use crate::message_queue::token_event_message_queue::Redis;
 use crate::monitor::client::GrpcClient;
 use crate::monitor::utils::constant::{TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID_2022};
 use crate::monitor::utils::utils::{
@@ -319,7 +319,7 @@ impl Monitor {
     ) -> anyhow::Result<()> {
         if !all_events.is_empty() {
             self.message_queue
-                .batch_queue_holder_event(all_events, monitor_logger)
+                .batch_enqueue_holder_event(all_events, monitor_logger)
                 .await?;
         }
         Ok(())
@@ -496,7 +496,7 @@ impl Monitor {
 mod tests {
     use super::*;
     use crate::baseline::getProgramAccounts::HttpClient;
-    use crate::message_queue::message_queue::RedisQueueConfig;
+    use crate::message_queue::token_event_message_queue::RedisQueueConfig;
 
     #[tokio::test]
     async fn test_monitor() {

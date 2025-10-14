@@ -1,77 +1,33 @@
+pub(crate) use crate::message_queue::{Redis, RedisQueueConfig};
 use crate::monitor::monitor::{InstructionType, TokenEvent};
 use crate::utils::timer::TaskLogger;
 use anyhow::{Error, Result, anyhow};
-use deadpool_redis::{Config, Connection as DeadpoolConnection, Pool, Runtime};
+use redis::streams::{StreamReadOptions, StreamReadReply};
 use redis::{AsyncCommands, Value};
 use tracing::{info, warn};
 
-#[derive(Debug, Clone)]
-pub struct RedisQueueConfig {
-    pub namespace: String,
-    pub consumer_group: String,
-    pub stream_ttl: Option<i64>,
-    pub max_stream_length: i64,
-    pub stats_ttl: Option<i64>,
-}
-
-impl Default for RedisQueueConfig {
-    fn default() -> Self {
-        Self {
-            namespace: "scheduler".to_string(),
-            consumer_group: "consumer".to_string(),
-            stream_ttl: Some(3600),
-            max_stream_length: 200000,
-            stats_ttl: Some(30 * 24 * 3600), // 30天TTL
-        }
-    }
-}
-#[derive(Debug, Clone)]
-pub struct Redis {
-    pub queue_connection_pool: Pool, // 消息队列连接池
-    pub redis_queue_config: RedisQueueConfig,
-}
-
 impl Redis {
-    /// 创建一个新的 Redis 服务实例，并初始化连接池
-    pub async fn new(redis_url: &str, config: RedisQueueConfig) -> Result<Self, Error> {
-        // 正确方式：直接将 URL 字符串传给 from_url
-        let cfg = Config::from_url(redis_url);
-
-        let pool = cfg
-            .create_pool(Some(Runtime::Tokio1))
-            .map_err(|e| anyhow!("Failed to create Deadpool Redis pool: {}", e))?;
-
-        info!("✅ [REDIS] Deadpool connection pool created successfully.");
-
-        Ok(Self {
-            queue_connection_pool: pool,
-            redis_queue_config: config,
-        })
-    }
-
-    /// 异步从 deadpool 中获取一个连接
-    pub async fn get_connection(&self) -> Result<DeadpoolConnection, Error> {
-        let conn = self.queue_connection_pool.get().await?;
-        Ok(conn)
-    }
-
     /// 初始化消息队列
     pub async fn initialize_message_queue(&self) -> Result<(), Error> {
         let mut conn = self.get_connection().await?;
         let config = self.redis_queue_config.clone();
-        let stream_name = config.namespace;
+        let stream_name = config.token_event_namespace;
 
         // 尝试创建消费者组，如果stream已存在则忽略错误，否则同时创建stream
         // stream_name 为stream键名
         // consumer_group 要创建的消费组的名称
         match conn
-            .xgroup_create_mkstream::<_, _, _, String>(&stream_name, &config.consumer_group, "0")
+            .xgroup_create_mkstream::<_, _, _, String>(
+                &stream_name,
+                &config.token_event_consumer_group,
+                "0",
+            )
             .await
         {
             Ok(result) => {
                 info!(
                     "✅ [REDIS] Consumer group '{}' created successfully for stream '{}': {}",
-                    config.consumer_group, stream_name, result
+                    config.token_event_consumer_group, stream_name, result
                 );
             }
             Err(e) => {
@@ -80,25 +36,25 @@ impl Redis {
                     // 启动时，消息队列已经存在，属于正常情况
                     info!(
                         "ℹ️ [REDIS] Consumer group '{}' already exists for stream '{}' - continuing",
-                        config.consumer_group, stream_name
+                        config.token_event_consumer_group, stream_name
                     );
                 } else {
                     // 其他错误需要报告
                     warn!(
                         "⚠️ [REDIS] Failed to create consumer group '{}' for stream '{}': {}",
-                        config.consumer_group, stream_name, error_msg
+                        config.token_event_consumer_group, stream_name, error_msg
                     );
                     return Err(Error::from(e));
                 }
             }
         }
 
-        info!("✅ [REDIS] Message queue initialization completed successfully");
+        info!("✅ [REDIS] Token event queue initialization completed successfully");
 
         Ok(())
     }
 
-    pub async fn batch_queue_holder_event(
+    pub async fn batch_enqueue_holder_event(
         &self,
         token_events: Vec<TokenEvent>,
         monitor_logger: &mut TaskLogger,
@@ -109,7 +65,7 @@ impl Redis {
 
         monitor_logger.log("start to getting a connection");
         let mut conn = self.get_connection().await?;
-        let stream_name = &self.redis_queue_config.namespace;
+        let stream_name = &self.redis_queue_config.token_event_namespace;
 
         let mut pipe = redis::pipe();
         monitor_logger.log("start to push stream into pipe");
@@ -162,26 +118,16 @@ impl Redis {
     ) -> Result<Vec<(String, TokenEvent)>, Error> {
         logger.log("start to getting connection");
         let mut conn = self.get_connection().await?;
-        let stream_name = &self.redis_queue_config.namespace;
-        let consumer_group = &self.redis_queue_config.consumer_group;
+        let stream_name = &self.redis_queue_config.token_event_namespace;
+        let consumer_group = &self.redis_queue_config.token_event_consumer_group;
 
         logger.log("start to batch reading");
-        // 使用 XREADGROUP 批量读取消息
-        let results: redis::streams::StreamReadReply = redis::cmd("XREADGROUP")
-            .arg("GROUP")
-            .arg(consumer_group)
-            .arg(consumer_name)
-            .arg("COUNT")
-            .arg(max_count)
-            .arg("BLOCK")
-            .arg(block_ms)
-            .arg("STREAMS")
-            .arg(stream_name)
-            .arg(">")
-            .query_async(&mut *conn)
-            .await
-            .map_err(|e| anyhow!("Failed to read from stream: {}", e))?;
 
+        let opts = StreamReadOptions::default()
+            .group(&consumer_group, consumer_name)
+            .count(max_count)
+            .block(block_ms);
+        let results: StreamReadReply = conn.xread_options(&[stream_name], &[">"], &opts).await?;
         let mut events = Vec::new();
 
         logger.log("start to parsing data");
@@ -201,7 +147,7 @@ impl Redis {
                             message_id, e
                         );
                         // 解析失败的消息也要 ACK，避免重复处理
-                        let _ = self.ack_message(&message_id).await;
+                        let _ = self.ack_message_token_event(&message_id).await;
                     }
                 }
             }
@@ -221,10 +167,10 @@ impl Redis {
     }
 
     /// 确认消息已处理（ACK）
-    pub async fn ack_message(&self, message_id: &str) -> Result<(), Error> {
+    pub async fn ack_message_token_event(&self, message_id: &str) -> Result<(), Error> {
         let mut conn = self.get_connection().await?;
-        let stream_name = &self.redis_queue_config.namespace;
-        let consumer_group = &self.redis_queue_config.consumer_group;
+        let stream_name = &self.redis_queue_config.token_event_namespace;
+        let consumer_group = &self.redis_queue_config.token_event_consumer_group;
 
         let _: i32 = conn
             .xack(stream_name, consumer_group, &[message_id])
@@ -311,8 +257,8 @@ impl Redis {
         }
 
         let mut conn = self.get_connection().await?;
-        let stream_name = &self.redis_queue_config.namespace;
-        let consumer_group = &self.redis_queue_config.consumer_group;
+        let stream_name = &self.redis_queue_config.token_event_namespace;
+        let consumer_group = &self.redis_queue_config.token_event_consumer_group;
 
         let ids: Vec<&str> = message_ids.iter().map(|s| s.as_str()).collect();
         let _: i32 = conn

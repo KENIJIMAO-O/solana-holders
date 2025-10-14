@@ -1,6 +1,6 @@
 use crate::baseline::getProgramAccounts::HttpClient;
 use crate::database::postgresql::{DatabaseConfig, DatabaseConnection};
-use crate::message_queue::message_queue::{Redis, RedisQueueConfig};
+use crate::message_queue::token_event_message_queue::{Redis, RedisQueueConfig};
 use crate::monitor::client::GrpcClient;
 use crate::monitor::monitor::{Monitor, MonitorConfig, ReConnectConfig};
 use crate::sync_controller::sync_controller::SyncController;
