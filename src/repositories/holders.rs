@@ -18,8 +18,9 @@ pub struct HolderUpsertData {
     pub last_updated_slot: i64,
 }
 
+/// establish_holders_baseline 函数聚合需要，将同一个 holder 对于 同一种代币且不同token_account中的余额聚合
 /// 将 TokenHolder 列表按 (mint, owner) 分组，并聚合余额和 slot
-fn aggregate_token_holders(token_accounts: &[TokenHolder]) -> Vec<HolderUpsertData> {
+pub fn aggregate_token_holders(token_accounts: &[TokenHolder]) -> Vec<HolderUpsertData> {
     // 使用 HashMap 来进行聚合
     // Key: (mint_pubkey, owner_pubkey)
     // Value: (aggregated_balance, max_slot)
@@ -56,6 +57,33 @@ fn aggregate_token_holders(token_accounts: &[TokenHolder]) -> Vec<HolderUpsertDa
             last_updated_slot: token_accounts[0].slot,
         })
         .collect();
+
+    results
+}
+
+pub fn aggregate_events(events: &[Event]) -> Vec<HolderUpsertData> {
+    let mut aggregation_map: HashMap<(String, String), (Decimal, i64)> = HashMap::new();
+
+    for event in events {
+        let delta = event.delta;
+
+        let mut entry = aggregation_map
+            .entry((event.mint_pubkey.clone(), event.owner_pubkey.clone()))
+            .or_insert((Decimal::ZERO, 0));
+
+        entry.0 += delta;
+        entry.1 = entry.1.max(event.slot);
+    };
+
+    let results: Vec<HolderUpsertData> = aggregation_map
+        .into_iter()
+        .map(|((mint, owner), (delta, lastest_slot))| HolderUpsertData{
+            mint_pubkey: mint,
+            owner_pubkey: owner,
+            balance: delta,
+            last_updated_slot:lastest_slot
+        })
+    .collect();
 
     results
 }
@@ -142,17 +170,20 @@ impl HoldersRepository for DatabaseConnection {
             return Ok(vec![]);
         }
 
+        // 聚合数据
+        let aggregate_datas = aggregate_events(events);
+
         // 收集所有需要的字段，包括 mint_pubkey
-        let mint_pubkeys: Vec<String> = events
+        let mint_pubkeys: Vec<String> = aggregate_datas
             .iter()
             .map(|event| event.mint_pubkey.clone())
             .collect();
-        let owner_pubkeys: Vec<String> = events
+        let owner_pubkeys: Vec<String> = aggregate_datas
             .iter()
             .map(|event| event.owner_pubkey.clone())
             .collect();
-        let deltas: Vec<String> = events.iter().map(|event| event.delta.to_string()).collect();
-        let last_updated_slots: Vec<i64> = events.iter().map(|event| event.slot as i64).collect();
+        let deltas: Vec<String> = aggregate_datas.iter().map(|event| event.balance.to_string()).collect();
+        let last_updated_slots: Vec<i64> = aggregate_datas.iter().map(|event| event.last_updated_slot).collect();
 
         let mut tx = self.pool.begin().await?;
 
@@ -178,6 +209,7 @@ impl HoldersRepository for DatabaseConnection {
         .execute(&mut *tx)
         .await?;
 
+        // 2.删除余额为0的holder数据
         let delete_result = sqlx::query!(
             r#"
       DELETE FROM holders AS h
@@ -192,7 +224,7 @@ impl HoldersRepository for DatabaseConnection {
         .execute(&mut *tx)
         .await?;
 
-        // 2. 统计每个 mint 的 holder 数量（balance > 0）
+        // 3. 统计每个 mint 的 holder 数量（balance > 0）
         let unique_mints: HashSet<String> = events
             .iter()
             .map(|event| event.mint_pubkey.clone())
@@ -254,5 +286,31 @@ mod tests {
         ];
         let holders_upsert_data = aggregate_token_holders(&token_holders);
         println!("{:?}", holders_upsert_data);
+    }
+
+    #[test]
+    fn test_aggregate_events() {
+        let events = vec![
+            Event{
+                slot: 1,
+                tx_sig: "tx1".to_string(),
+                mint_pubkey: "DrZ26cKJDksVRWib3DVVsjo9eeXccc7hKhDJviiYEEZY".to_string(),
+                account_pubkey: "F3nV5qfyKJjgVg1vnnkDWwxkr9W1C2MpTTJwzcqCi53k".to_string(),
+                owner_pubkey: "G7yFPLBVcToFpz5cgmWCNjcAygVzT4m9VnX1FwCa3zqY".to_string(),
+                delta: Decimal::from_str("1").unwrap(),
+                confirmed: false,
+            },
+            Event{
+                slot: 5,
+                tx_sig: "tx2".to_string(),
+                mint_pubkey: "DrZ26cKJDksVRWib3DVVsjo9eeXccc7hKhDJviiYEEZY".to_string(),
+                account_pubkey: "".to_string(),
+                owner_pubkey: "G7yFPLBVcToFpz5cgmWCNjcAygVzT4m9VnX1FwCa3zqY".to_string(),
+                delta: Decimal::from_str("-2").unwrap(),
+                confirmed: false,
+            },
+        ];
+        let res = aggregate_events(&events);
+        println!("res: {:?}", res);
     }
 }

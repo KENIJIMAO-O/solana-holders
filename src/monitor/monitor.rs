@@ -265,8 +265,6 @@ impl Monitor {
         let tx_count = sub_block.transactions.len();
         let mut monitor_logger = TaskLogger::new("monitor logger", "1");
 
-        debug!("📦 Slot {}: 开始处理 {} 笔交易", block_slot, tx_count);
-
         monitor_logger.log("start to handle whole txs in a slot");
         // 并发处理所有交易
         let tasks: Vec<_> = sub_block
@@ -299,16 +297,16 @@ impl Monitor {
 
         for result in results {
             if let Ok(Some(events)) = result {
-                println!("token_events: {:?}", events);
                 all_events.extend(events);
             }
         }
+        let target_tx_count = all_events.len();
 
         // 批量发送到消息队列
         monitor_logger.log("start to push events to message queue");
-        // self.send_events_to_message_queue(all_events, &mut monitor_logger).await?;
+        self.send_events_to_message_queue(all_events, &mut monitor_logger).await?;
 
-        info!("✅ Slot {} 处理完成: 总交易={}", block_slot, tx_count);
+        info!("✅ Slot {} 处理完成: 总交易={}, 目标交易={}", block_slot, tx_count, target_tx_count);
         Ok(())
     }
 
@@ -506,7 +504,7 @@ mod tests {
         let client = GrpcClient::new(&rpc_url);
 
         // 创建消息队列
-        let redis_url = std::env::var("REDIS_URL");
+        let redis_url = env::var("REDIS_URL");
         let config = RedisQueueConfig::default();
         let message_queue = Redis::new(&redis_url.unwrap(), config).await.unwrap();
         let _ = message_queue.initialize_message_queue().await.unwrap();
@@ -524,39 +522,5 @@ mod tests {
         let token = cancellation_token.child_token();
 
         let result = onchain_monitor.run_with_reconnect(token).await;
-    }
-
-    #[tokio::test]
-    async fn test_monitor_get_token_holders() {
-        dotenv::dotenv().ok();
-        let monitor_config = MonitorConfig::new();
-        let rpc_url = env::var("RPC_URL").unwrap();
-        let client = GrpcClient::new(&rpc_url);
-
-        // 创建消息队列
-        let redis_url = std::env::var("REDIS_URL");
-        let config = RedisQueueConfig::default();
-        let message_queue = Redis::new(&redis_url.unwrap(), config).await.unwrap();
-        let _ = message_queue.initialize_message_queue().await.unwrap();
-
-        let re_connect_config = ReConnectConfig::default();
-
-        let mut onchain_monitor = Monitor::new(
-            monitor_config,
-            client,
-            Arc::new(message_queue),
-            re_connect_config,
-        );
-
-        let cancellation_token = CancellationToken::new();
-        let token = cancellation_token.child_token();
-
-        onchain_monitor.run_with_reconnect(token).await;
-
-        let rpc_url = std::env::var("RPC_URL").unwrap();
-        let http_client = HttpClient::new(rpc_url).unwrap();
-
-        let mint = "DrZ26cKJDksVRWib3DVVsjo9eeXccc7hKhDJviiYEEZY";
-        let res = http_client.get_program_accounts(mint).await;
     }
 }

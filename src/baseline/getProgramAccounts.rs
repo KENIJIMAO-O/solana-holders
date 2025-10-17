@@ -30,7 +30,7 @@ impl HttpClient {
             .pool_max_idle_per_host(20)
             .pool_idle_timeout(Duration::from_secs(60))
             .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(600))
+            .timeout(Duration::from_secs(1600))
             .tcp_keepalive(Duration::from_secs(30))
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to create batch HTTP client: {}", e))?;
@@ -48,8 +48,8 @@ impl HttpClient {
             "id": 1,
             "method": "getAccountInfo",
             "params": [
-                "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3",
-                {"encoding": "base58"}
+                mint,
+                {"encoding": "base64"}
             ]
         });
         let response = self
@@ -59,15 +59,15 @@ impl HttpClient {
             .json(&request_body)
             .send()
             .await?;
+
         // 解析响应
         let json_response: serde_json::Value = response.json().await?;
-        let result = json_response
-            .get("result")
-            .ok_or_else(|| anyhow::anyhow!("响应中没有result字段"))?;
 
         let get_program_accounts_result: GetAccountInfoData =
-            serde_json::from_value(result.clone())?;
+            serde_json::from_value(json_response.clone())?;
         let owner = get_program_accounts_result.result.value.owner.clone();
+        println!("mint: {}", mint);
+        println!("owner: {}", owner);
 
         let token_holders = if owner == TOKEN_PROGRAM_ID.to_string() {
             self.get_program_accounts(mint).await
@@ -97,7 +97,7 @@ impl HttpClient {
                     },
                     {
                         "memcmp": {
-                        "offset": 32,
+                        "offset": 0,
                         "bytes": mint
                         }
                     }
@@ -105,7 +105,6 @@ impl HttpClient {
                 }
             ]
         });
-
         let response = self
             .http_client
             .post(&self.rpc_url)
@@ -168,6 +167,8 @@ impl HttpClient {
         if let Some(first_holder) = token_holders.first() {
             println!("转换后的第一条数据: {:?}", first_holder);
         }
+        let holder_count = token_holders.len();
+        println!("holders_count: {}", holder_count);
 
         // Ok(result) 我不能直接这样返回引用，因为当前引用的值在当前函数结束的时候就已经被释放了，所以返回的时候引用指向空值
         // 有一种情况rust允许函数返回引用，那就是这个返回的值是从函数外部传进来的，同时还得声明其生命周期（第一次具象化感受到了生命周期的作用）
@@ -262,6 +263,8 @@ impl HttpClient {
         if let Some(first_holder) = token_holders.first() {
             println!("转换后的第一条数据: {:?}", first_holder);
         }
+        let token_count = token_holders.len();
+        println!("token_count: {}", token_count);
 
         Ok(token_holders)
     }
@@ -279,6 +282,30 @@ mod tests {
         let mut output = File::create(path).unwrap();
 
         write!(output, "wuxizhi").unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_get_token_holders() {
+        dotenv::dotenv().ok();
+        let rpc_url = std::env::var("RPC_URL").unwrap();
+        let http_client = HttpClient::new(rpc_url).unwrap();
+
+        let mint = "2oQNkePakuPbHzrVVkQ875WHeewLHCd2cAwfwiLQbonk";
+        let res = http_client.get_token_holders(mint).await;
+
+        let path = "getProgramAccounts.json";
+        let mut output = File::create(path).unwrap();
+
+        if let Ok(json_value) = res {
+            println!("start to write res into file");
+            if let Err(e) = serde_json::to_writer_pretty(&mut output, &json_value) {
+                println!("🔥 写入JSON文件失败: {}", e);
+            } else {
+                println!("👍 文件 '{}' 写入成功!", path);
+            }
+        } else {
+            println!("get_program_accounts failed");
+        }
     }
 
     #[tokio::test]

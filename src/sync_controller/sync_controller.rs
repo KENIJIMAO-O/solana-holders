@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use crate::baseline::getProgramAccounts::HttpClient;
 use crate::database::postgresql::DatabaseConnection;
 use crate::message_queue::token_event_message_queue::Redis;
@@ -10,8 +11,10 @@ use crate::utils::timer::TaskLogger;
 use rust_decimal::Decimal;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
+use crate::repositories::AtomicityData;
 
 #[derive(Clone)]
 pub struct SyncController {
@@ -40,25 +43,21 @@ impl SyncController {
     ) -> anyhow::Result<()> {
         const BATCH_SIZE: usize = 1000;
         const BATCH_TIMEOUT_MS: u64 = 100; // Duration::from_millis 接收 u64
-        let consumer_name = "sync_dequeuer";
+        let consumer_name = "token_event_dequeuer";
 
         loop {
             let mut logger = TaskLogger::new("sync_controller", "2");
 
-            // 使用 tokio::select! 来并发地监听“取消信号”和“出队操作”
-            // 该宏允许你同时等待多个不同的异步操作，并且在其中任意一个结束后立即执行相应的代码块
             tokio::select! {
-                // 分支 1: 如果收到了取消信号
                 _ = cancellation_token.cancelled() => {
                     info!("Monitor received cancellation signal. Shutting down...");
-                    break; // 跳出 loop 循环，函数将优雅地结束
+                    break;
                 }
 
-                // 分支 2: 执行出队操作
                 datas_result = self.redis.batch_dequeue_holder_event(
                     consumer_name,
                     BATCH_SIZE,
-                    BATCH_TIMEOUT_MS as usize, // 确保类型匹配
+                    BATCH_TIMEOUT_MS as usize,
                     &mut logger,
                 ) => {
                     let datas = match datas_result {
@@ -89,7 +88,7 @@ impl SyncController {
                                     // 2. 如果解析成功，构建 Event 对象
                                     let event = Event::new(
                                         raw_event.slot,
-                                        raw_event.tx_signature,
+                                        raw_event.tx_signature.clone(),
                                         raw_event.mint_address.to_string(),
                                         raw_event.account_address.to_string(),
                                         raw_event.owner_address.map_or("".to_string(), |o| o.to_string()),
@@ -97,7 +96,7 @@ impl SyncController {
                                         raw_event.confirmed,
                                     );
                                     // 3. 将有效的元组包裹在 Some 中返回，以保留此数据
-                                    Some((message_id, event))
+                                    Some((message_id.clone(), event))
                                 }
                                 Err(e) => {
                                     // 如果解析失败，打印日志并返回 None，这条记录将被安全地丢弃
@@ -111,57 +110,54 @@ impl SyncController {
                         })
                         .unzip();
 
-                    // todo!: 这里要干的一件事情就是将新出现的token，进行baseline构建，所以需要一张新表
-                    // 构建baseline
+                    // 将新代币发送到 baseline 消息队列中
                     let mints: Vec<String> = token_events
                         .iter()
                         .map(|token_event| token_event.mint_pubkey.clone())
+                        .collect::<HashSet<_>>()
+                        .into_iter()
                         .collect();
                     let untracked_mints = self.database.is_tracked_batch(&mints).await?;
-
-
+                    self.redis.batch_enqueue_baseline_task(&untracked_mints).await?;
 
                     // --- 核心职责：将新的数据更新到数据库中 ---
+                    // todo!: 这里我想说的就是，对于任意一个数据，一定会进events表，如果这个代币已经构建了baseline，那么可以直接利用从token queue获取的数据更新
+                    // todo!: 如果没有构建baseline，那么就不用更新，等到构建完之后，catch-up需要从数据中将所有和他相关的events全部合并之后，回到token queue
+                    // todo!: 所以对于数据库中的数据需要更新三次，第一是baseline构建的时候的更新，第二是catch-up时候的更新，最后是当前函数中token queue的更新
                     if !token_events.is_empty() {
-                        // 只更新 events 表
-                        if let Err(e) = self.database.upsert_events_batch(&token_events, &mut logger).await {
-                            error!("Error upserting events: {}", e);
-                            // 如果写入数据库失败，我们不应该 ACK 消息，让它可以被重新处理
-                            continue;
+                        // 对于events表，无论当前代币处于 Not started baseline_building catching_up synced 任意一个阶段，都需要更新
+                        match self.database.upsert_events_batch(&token_events, &mut logger).await {
+                            Ok(()) => {
+                                // ack token_queue message
+                                 if let Err(e) = self.redis.ack_messages(&message_ids).await {
+                                    error!("Error acknowledging messages: {}", e);
+                                    // ACK 失败是一个严重问题，需要考虑如何处理（重试或告警）
+                                    continue;
+                                };
+                            } ,
+                            Err(e) => {
+                                error!("Error upserting events: {}", e);
+                                // 如果写入数据库失败，我们不应该 ACK 消息，让它可以被重新处理
+                                continue;
+                            }
                         };
-                            if let Err(e) = self
-                        .database
-                        .upsert_token_accounts_batch(&token_events)
-                        .await
-                    {
-                        error!("upsert token accounts batch failed: {}", e);
-                        continue;
-                    };
-                    let holder_counts = match self.database.upsert_holder_batch(&token_events).await {
-                        Ok(h) => h,
-                        Err(e) => {
-                            error!("upsert holder batch failed:{}", e);
-                            return Err(e);
-                        }
-                    };
-                    let slot = token_events[0].slot;
-                    if let Err(e) = self
-                        .database
-                        .update_mint_stats_holder_count(&holder_counts, slot as i64)
-                        .await
-                    {
-                        error!("Error update mint stats holder count: {}", e);
-                    };
                         logger.log("sql upsert events complete");
 
-                        // 数据库写入成功之后才能 ACK
-                        if let Err(e) = self.redis.ack_messages(&message_ids).await {
-                            error!("Error acknowledging messages: {}", e);
-                            // ACK 失败是一个严重问题，需要考虑如何处理（重试或告警）
-                            continue;
-                        };
-                        logger.log("redis ack messages complete");
-                        info!("✅ Monitor: Ingested {} events into the database.", token_events.len());
+                        // 对于其他的几个表，必须等到代币完成catch-up之后，即tracked_mints.status == synced 才能在这里更新
+                        let synced_mints = self.database.filter_synced_mints(&mints).await?;
+                        let synced_mints_set: HashSet<&str> = synced_mints.iter().map(|s| s.as_str()).collect();
+
+                        let synced_token_events: Vec<Event> = token_events
+                            .into_iter()
+                            .filter(|token_event| {
+                                synced_mints_set.contains(token_event.mint_pubkey.as_str())
+                            })
+                            .collect();
+
+                        if synced_token_events.is_empty() { continue }
+                        if let Err(e) = self.database.upsert_synced_mints_atomic(&synced_token_events).await {
+                            error!("upsert token_account, holders, mint_stats error: {}", e);
+                        }
                     }
                 }
             }
@@ -170,110 +166,280 @@ impl SyncController {
         Ok(())
     }
 
+    pub async fn consume_baseline_mints_for_queue(
+        &self,
+        cancellation_token: CancellationToken,
+    ) -> anyhow::Result<()> {
+        const MAX_CONCURRENT_BASELINE: usize = 10; // 最大并发数
+        const DEQUEUE_SIZE: usize = 50; // 批量拉取任务数
+        const BATCH_TIMEOUT_MS: u64 = 100;
+        let consumer_name = "baseline_dequeuer";
+
+        // 创建信号量控制并发数
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_BASELINE));
+
+        loop {
+            let mut logger = TaskLogger::new("sync_controller", "3");
+
+            tokio::select! {
+                // 分支1 收到了取消信息
+                _ = cancellation_token.cancelled() => {
+                    info!("baseline consumer received cancellation signal. Shutting down...");
+                    break;
+                }
+
+                mints_result = self.redis.batch_dequeue_baseline_task(
+                    consumer_name,
+                    DEQUEUE_SIZE,
+                    BATCH_TIMEOUT_MS as usize,
+                ) => {
+                    let mints = match mints_result {
+                        Ok(m) => m,
+                        Err(e) => {
+                            error!("Failed to dequeue in baseline consumer: {}", e);
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    };
+
+                    if mints.is_empty() {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+
+                    logger.log(&format!("Dequeued {} mints for baseline processing", mints.len()));
+
+                    // 使用 Semaphore 控制并发，spawn 多个任务
+                    let mut handles = Vec::new();
+
+                    for (message_id, mint) in mints {
+                        let permit = match semaphore.clone().acquire_owned().await {
+                            Ok(p) => p,
+                            Err(e) => {
+                                error!("Failed to acquire semaphore: {}", e);
+                                continue;
+                            }
+                        };
+                        let controller = self.clone();
+
+                        let handle = tokio::spawn(async move {
+                            let _permit = permit; // 持有 permit，函数结束时自动释放
+
+                            // 完整的 baseline 处理流程
+                            let result = Self::process_single_baseline(controller, &mint).await;
+
+                            (message_id, mint, result)
+                        });
+
+                        handles.push(handle);
+                    }
+
+                    // 等待所有任务完成
+                    logger.log("Waiting for all baseline tasks to complete");
+                    let results = futures::future::join_all(handles).await;
+
+                    // 统计成功和失败
+                    let mut success_count = 0;
+                    let mut fail_count = 0;
+
+                    for result in results {
+                        match result {
+                            Ok((message_id, mint, Ok(_))) => {
+                                // 处理成功，ACK 消息
+                                if let Err(e) = self.redis.ack_message_baseline(&message_id).await {
+                                    error!("Failed to ACK message {} for mint {}: {}", message_id, mint, e);
+                                } else {
+                                    info!("✅ Baseline completed for mint: {}", mint);
+                                    success_count += 1;
+                                }
+                            }
+                            Ok((_message_id, mint, Err(e))) => {
+                                // 处理失败，不 ACK，消息留在 PEL 等待重试
+                                // todo!: 现在有一个问题就是对于USDT/USDC这种有点拉不下来
+                                error!("❌ Baseline failed for mint {}: {}", mint, e);
+                                fail_count += 1;
+                            }
+                            Err(e) => {
+                                // Task panic
+                                error!("⚠️ Baseline task panicked: {}", e);
+                                fail_count += 1;
+                            }
+                        }
+                    }
+
+                    info!("Baseline batch complete: {} succeeded, {} failed", success_count, fail_count);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 处理单个 mint 的完整 baseline 流程
+    async fn process_single_baseline(
+        controller: SyncController,
+        mint: &str,
+    ) -> anyhow::Result<()> {
+        // 步骤 1: 构建 baseline 数据
+        let baseline_slot = match controller.build_baseline(mint).await {
+            Ok(slot) => {
+                info!("Baseline data fetched for mint {}, slot: {}", mint, slot);
+                slot
+            }
+            Err(e) => {
+                error!("Failed to build baseline for mint {}: {}", mint, e);
+                return Err(e);
+            }
+        };
+
+        // 步骤 2: 记录 baseline 开始状态
+        if let Err(e) = controller
+            .database
+            .start_baseline_batch(&[mint.to_string()], &[baseline_slot])
+            .await
+        {
+            error!("Failed to mark baseline start for mint {}: {}", mint, e);
+            return Err(e);
+        }
+
+        // 步骤 3: 标记 baseline 完成，进入 catching_up 状态
+        if let Err(e) = controller
+            .database
+            .finish_baseline_batch(&[mint.to_string()])
+            .await
+        {
+            error!("Failed to mark baseline finish for mint {}: {}", mint, e);
+            return Err(e);
+        }
+
+        // 步骤 4: 执行 catch-up，追赶历史事件
+        if let Err(e) = controller.catch_up(baseline_slot, mint).await {
+            error!("Failed to catch up for mint {}: {}", mint, e);
+            return Err(e);
+        }
+
+        // 步骤 5: 标记 catch-up 完成，进入 synced 状态
+        if let Err(e) = controller
+            .database
+            .finish_catch_up_batch(&[mint.to_string()])
+            .await
+        {
+            error!("Failed to mark catch up finish for mint {}: {}", mint, e);
+            return Err(e);
+        }
+
+        info!("✅ Full baseline pipeline completed for mint: {}", mint);
+        Ok(())
+    }
+
     pub async fn build_baseline(&self, mint: &str) -> anyhow::Result<i64> {
         let token_accounts = self.http_client.get_token_holders(mint).await?;
 
-        let mut logger = TaskLogger::new("baseline", "3");
+        let baseline_slot = if !token_accounts.is_empty() {
+            // 使用原子性方法建立 baseline，确保三张表同时成功或同时失败
+            self.database
+                .establish_baseline_atomic(mint, &token_accounts)
+                .await?
+        } else {
+            0
+        };
 
-        if !token_accounts.is_empty() {
-            if let Err(e) = self
-                .database
-                .establish_token_accounts_baseline(&token_accounts, &mut logger)
-                .await
-            {
-                error!("Error establish token accounts baseline: {}", e);
-            }
-
-            let holder_account = match self
-                .database
-                .establish_holders_baseline(&token_accounts, &mut logger)
-                .await
-            {
-                Ok(h) => h,
-                Err(e) => {
-                    error!("Error establish holders baseline: {}", e);
-                    return Err(e);
-                }
-            };
-
-            let last_updated_slot = token_accounts[0].slot;
-
-            if let Err(e) = self
-                .database
-                .establish_mint_stats_baseline(mint, holder_account as i64, last_updated_slot)
-                .await
-            {
-                error!("establish mint stats baseline: {}", e);
-            }
-        }
-
-        let baseline_slot = token_accounts[0].slot;
         Ok(baseline_slot)
     }
 
-    // baseline 获取之后，下一步是将 baseline slot -> 当前 monitor slot之间的数据进行整合
+    /// 从 baseline_slot 追赶到当前已有的历史事件
+    /// 当 next_cursor 为 None 时表示历史数据已追完，直接退出
+    /// 之后的新事件由 consume_events_from_queue 统一处理
     pub async fn catch_up(&self, baseline_slot: i64, mint: &str) -> anyhow::Result<()> {
-        const BATCH_SIZE: i64 = 1000; // 每次处理 1000 条事件
-        // 初始化游标，(start_slot - 1, i64::MAX) 是一个安全的起点
+        const BATCH_SIZE: i64 = 1000;
         let mut cursor = (baseline_slot - 1, i64::MAX);
+        let mut total_processed = 0;
+
+        info!("Starting catch-up for mint {} from slot {}", mint, baseline_slot);
 
         loop {
-            let mut logger = TaskLogger::new("sync controller-catch up", "2");
-            let (token_events, next_cursor) = match self
-                .database
-                .get_next_events_batch(cursor, mint, BATCH_SIZE)
-                .await
-            {
-                Ok((token_events, next_cursor)) => match next_cursor {
-                    Some(next_cursor) => (token_events, next_cursor),
-                    None => {
-                        info!("next_cursor is Null, wait for a wheal");
-                        tokio::time::sleep(Duration::from_secs(200)).await;
+            match self.database.get_next_events_batch(cursor, mint, BATCH_SIZE).await {
+                Ok((token_events, Some(next_cursor))) => {
+                    // 有更多历史数据，继续处理
+                    if token_events.is_empty() {
+                        cursor = next_cursor;
                         continue;
                     }
-                },
+
+                    self.database.upsert_synced_mints_atomic(&token_events).await?;
+                    total_processed += token_events.len();
+                    cursor = next_cursor;
+                }
+                Ok((token_events, None)) => {
+                    // 没有更多历史数据，处理最后一批后退出
+                    if !token_events.is_empty() {
+                        self.database.upsert_synced_mints_atomic(&token_events).await?;
+                        total_processed += token_events.len();
+                    }
+
+                    info!("Catch-up completed for mint {}: processed {} events", mint, total_processed);
+                    break;
+                }
                 Err(e) => {
-                    error!("get next events batch");
+                    error!("Failed to get events batch for mint {}: {}", mint, e);
                     return Err(e);
                 }
-            };
-
-            if let Err(e) = self
-                .database
-                .upsert_token_accounts_batch(&token_events)
-                .await
-            {
-                error!("upsert token accounts batch failed: {}", e);
-                continue;
             }
-            let holder_counts = match self.database.upsert_holder_batch(&token_events).await {
-                Ok(h) => h,
-                Err(e) => {
-                    error!("upsert holder batch failed:{}", e);
-                    return Err(e);
-                }
-            };
-            let slot = token_events[0].slot;
-            if let Err(e) = self
-                .database
-                .update_mint_stats_holder_count(&holder_counts, slot as i64)
-                .await
-            {
-                error!("Error update mint stats holder count: {}", e);
-            }
-
-            logger.log("sql upsert events complete");
-
-            // 更新游标为函数返回的新游标
-            cursor = next_cursor;
         }
+
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use tracing_subscriber::{fmt, EnvFilter, Layer};
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use crate::database::postgresql::DatabaseConfig;
+    use crate::message_queue::RedisQueueConfig;
     use super::*;
 
+
+    fn set_up(){
+        dotenv::dotenv().ok();
+        let console_subscriber = fmt::layer()
+            .with_target(false)
+            .with_level(false)
+            .with_writer(std::io::stdout);
+        tracing_subscriber::registry()
+            .with(
+                console_subscriber.with_filter(
+                    EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "info,rustls=warn,sqlx=warn,hyper=warn,tokio=warn".into()),
+                ),
+            )
+            .init();
+    }
+
     #[tokio::test]
-    async fn test_sync_controller() {}
+    async fn test_consume_baseline_mints_for_queue() {
+        set_up();
+        // 创建消息队列
+        let redis_url = std::env::var("REDIS_URL");
+        let config = RedisQueueConfig::default();
+        let message_queue = Arc::new(Redis::new(&redis_url.unwrap(), config).await.unwrap());
+        let _ = message_queue.init_baseline_queue().await.unwrap();
+
+        let db_url = std::env::var("DATABASE_URL").unwrap();
+        let database_config = DatabaseConfig::new_optimized(db_url);
+        let database = Arc::new(DatabaseConnection::new(database_config).await.unwrap());
+
+        let http_rpc = std::env::var("RPC_URL").unwrap();
+        let http_client = Arc::new(HttpClient::new(http_rpc).unwrap());
+
+        let sync_controller =
+            SyncController::new(message_queue.clone(), database.clone(), http_client.clone());
+
+        let cancellation_token = CancellationToken::new();
+        let token = cancellation_token.child_token();
+        if let Err(e) = sync_controller.consume_baseline_mints_for_queue(token).await {
+            error!("Monitor error: {:?}", e);
+        }
+    }
 }

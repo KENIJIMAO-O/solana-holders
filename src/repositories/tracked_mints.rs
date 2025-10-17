@@ -22,6 +22,10 @@ pub trait TrackedMintsRepository {
     /// 返回未被追踪的 mint_pubkeys 数组
     async fn is_tracked_batch(&self, mint_pubkeys: &[String]) -> Result<Vec<String>, Error>;
 
+    /// 过滤出已经完成同步的 mints (status = 'synced')
+    /// 返回输入列表中状态为 synced 的 mint_pubkeys
+    async fn filter_synced_mints(&self, mint_pubkeys: &[String]) -> Result<Vec<String>, Error>;
+
     /// 获取 mint 的当前状态（单个查询保留，用于特殊场景）
     async fn get_status(&self, mint_pubkey: &str) -> Result<Option<String>, Error>;
 
@@ -136,6 +140,26 @@ impl TrackedMintsRepository for DatabaseConnection {
             .collect();
 
         Ok(untracked_mints)
+    }
+
+    async fn filter_synced_mints(&self, mint_pubkeys: &[String]) -> Result<Vec<String>, Error> {
+        if mint_pubkeys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let synced_mints = sqlx::query_scalar!(
+            r#"
+            SELECT mint_pubkey
+            FROM tracked_mints
+            WHERE mint_pubkey = ANY($1)
+              AND status = 'synced'
+            "#,
+            mint_pubkeys,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(synced_mints)
     }
 
     async fn get_status(&self, mint_pubkey: &str) -> Result<Option<String>, Error> {

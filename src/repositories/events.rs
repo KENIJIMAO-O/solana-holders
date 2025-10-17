@@ -5,6 +5,7 @@ use rust_decimal::Decimal;
 use sqlx::FromRow;
 use yellowstone_grpc_proto::tonic::async_trait;
 
+
 pub struct Event {
     pub slot: i64,
     pub tx_sig: String,

@@ -62,27 +62,30 @@ impl MintStatsRepository for DatabaseConnection {
         holder_counts: &[(String, i64)], // 我们要处理全部的数据，而不关注某一个键对应的值时，Vec<()>性能 > HashMap，因为数据在内存中是连续存放的
         last_updated_slot: i64,
     ) -> Result<(), Error> {
+        if holder_counts.is_empty() {
+            return Ok(());
+        }
+
         let mut tx = self.pool.begin().await?;
 
-        let (owners_pubkeys, deltas_i64): (Vec<String>, Vec<i64>) =
+        let (mint_pubkeys, holder_counts): (Vec<String>, Vec<i64>) =
             holder_counts.iter().cloned().unzip();
-        let deltas: Vec<String> = deltas_i64.iter().map(|d| d.to_string()).collect();
 
         sqlx::query!(
             r#"
-        UPDATE holders AS ta
+        UPDATE mint_stats AS ta
         SET
-            balance = ta.balance + t.delta::numeric, -- 核心逻辑：累加余额
+            holder_count = t.holder_count,
             last_updated_slot = $3,
             updated_at = now()
-        FROM UNNEST($1::varchar[], $2::text[])
-            AS t(owner_pubkey, delta)
+        FROM UNNEST($1::varchar[], $2::bigint[])
+            AS t(mint_pubkey, holder_count)
         WHERE
-            ta.owner_pubkey = t.owner_pubkey
+            ta.mint_pubkey = t.mint_pubkey
             AND ta.last_updated_slot < $3 -- 同样保留时效性检查
         "#,
-            &owners_pubkeys,
-            &deltas,
+            &mint_pubkeys,
+            &holder_counts,
             &last_updated_slot,
         )
         .execute(&mut *tx)
