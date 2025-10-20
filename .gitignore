@@ -6,3 +6,8 @@ test.json
 README.md
 CLAUDE.md
 log.log
+requirements.txt
+verify_slot_consistency.py
+package-lock.json
+package.json
+node_modules

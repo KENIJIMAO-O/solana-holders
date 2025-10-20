@@ -1,9 +1,45 @@
+use std::collections::HashMap;
 use crate::baseline::getProgramAccounts::TokenHolder;
 use crate::database::postgresql::DatabaseConnection;
 use crate::repositories::events::Event;
 use crate::utils::timer::TaskLogger;
 use anyhow::Error;
+use rust_decimal::Decimal;
 use yellowstone_grpc_proto::tonic::async_trait;
+use crate::repositories::TokenAccountAggregateData;
+
+/// 聚合相同 account_pubkey 的 events，避免 ON CONFLICT 多次更新同一行
+pub fn aggregate_token_account_events(events: &[Event]) -> Vec<TokenAccountAggregateData> {
+    // Key: account_pubkey, Value: (mint, owner, aggregated_delta, max_slot)
+    let mut aggregation_map: HashMap<String, (String, String, Decimal, i64)> = HashMap::new();
+
+    for event in events {
+        aggregation_map
+            .entry(event.account_pubkey.clone())
+            .and_modify(|(_, _, delta, slot)| {
+                *delta += event.delta;
+                *slot = (*slot).max(event.slot);
+            })
+            .or_insert((
+                event.mint_pubkey.clone(),
+                event.owner_pubkey.clone(),
+                event.delta,
+                event.slot,
+            ));
+    }
+
+    aggregation_map
+        .into_iter()
+        .map(|(acct, (mint, owner, delta, slot))| TokenAccountAggregateData {
+            acct_pubkey: acct,
+            mint_pubkey: mint,
+            owner_pubkey: owner,
+            delta,
+            last_updated_slot: slot,
+        })
+        .collect()
+}
+
 
 #[async_trait]
 pub trait TokenAccountsRepository {

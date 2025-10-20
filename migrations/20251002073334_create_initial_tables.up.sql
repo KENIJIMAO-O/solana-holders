@@ -21,6 +21,7 @@ CREATE TABLE token_accounts (
     mint_pubkey VARCHAR(44) NOT NULL,
     owner_pubkey VARCHAR(44) NOT NULL,
     balance NUMERIC(38,12) NOT NULL,          -- 若可用 BIGINT 建议改为 BIGINT
+    baseline_slot BIGINT,                     -- 允许 NULL，只有 baseline 创建的记录才有此值
     last_updated_slot BIGINT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );

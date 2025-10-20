@@ -66,8 +66,6 @@ impl HttpClient {
         let get_program_accounts_result: GetAccountInfoData =
             serde_json::from_value(json_response.clone())?;
         let owner = get_program_accounts_result.result.value.owner.clone();
-        println!("mint: {}", mint);
-        println!("owner: {}", owner);
 
         let token_holders = if owner == TOKEN_PROGRAM_ID.to_string() {
             self.get_program_accounts(mint).await
@@ -82,7 +80,7 @@ impl HttpClient {
 
     // 目前这个函数只能针对owner为TokenProgram的spl token，但对于owner为TokenProgram2022的spl token还没法获取
     pub async fn get_program_accounts(&self, mint: &str) -> Result<Vec<TokenHolder>, Error> {
-        let request_body = serde_json::json!({
+        let request_body = json!({
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "getProgramAccounts",
@@ -124,7 +122,6 @@ impl HttpClient {
         let get_program_accounts_result: GetProgramAccountsData =
             serde_json::from_value(result.clone())?;
         let slot = get_program_accounts_result.context.slot;
-        println!("slot: {}", slot);
 
         let token_holders: Vec<TokenHolder> = get_program_accounts_result
             .value
@@ -164,11 +161,6 @@ impl HttpClient {
                 decimals: value_info.account.data.parsed.info.token_amount.decimals,
             })
             .collect();
-        if let Some(first_holder) = token_holders.first() {
-            println!("转换后的第一条数据: {:?}", first_holder);
-        }
-        let holder_count = token_holders.len();
-        println!("holders_count: {}", holder_count);
 
         // Ok(result) 我不能直接这样返回引用，因为当前引用的值在当前函数结束的时候就已经被释放了，所以返回的时候引用指向空值
         // 有一种情况rust允许函数返回引用，那就是这个返回的值是从函数外部传进来的，同时还得声明其生命周期（第一次具象化感受到了生命周期的作用）
@@ -219,9 +211,6 @@ impl HttpClient {
             serde_json::from_value(result.clone())?;
         let slot = get_program_accounts_result.context.slot;
 
-        let total_accounts = get_program_accounts_result.value.len();
-        println!("RPC 返回的总账户数: {}", total_accounts);
-
         let token_holders: Vec<TokenHolder> = get_program_accounts_result
             .value
             .into_iter()
@@ -260,11 +249,6 @@ impl HttpClient {
                 decimals: value_info.account.data.parsed.info.token_amount.decimals,
             })
             .collect();
-        if let Some(first_holder) = token_holders.first() {
-            println!("转换后的第一条数据: {:?}", first_holder);
-        }
-        let token_count = token_holders.len();
-        println!("token_count: {}", token_count);
 
         Ok(token_holders)
     }

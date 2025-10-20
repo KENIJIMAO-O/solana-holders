@@ -1,15 +1,29 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use anyhow::Error;
+use rust_decimal::Decimal;
+use tracing::info;
 use yellowstone_grpc_proto::tonic::async_trait;
 use crate::database::postgresql::DatabaseConnection;
 use crate::repositories::events::Event;
 use crate::baseline::getProgramAccounts::TokenHolder;
+use crate::repositories::token_accounts::aggregate_token_account_events;
 
 pub mod events;
 pub mod holders;
 pub mod mint_stats;
 pub mod token_accounts;
 pub mod tracked_mints;
+
+/// token_accounts 聚合数据结构
+#[derive(Debug, Clone)]
+struct TokenAccountAggregateData {
+    acct_pubkey: String,
+    mint_pubkey: String,
+    owner_pubkey: String,
+    delta: Decimal,           // 聚合后的 delta
+    last_updated_slot: i64,   // 最大 slot
+}
+
 
 /// 该特征的作用是保证，在对token_accounts, holders, mint_stats这三张表更新时，必须保证更新的原子性
 #[async_trait]
@@ -29,29 +43,35 @@ impl AtomicityData for DatabaseConnection{
             return Ok(());
         }
 
+        info!("start upserting synced mints atomic");
         let mut tx = self.pool.begin().await?;
-        let account_pubkeys: Vec<String> = synced_events.iter()
-            .map(|e| e.account_pubkey.clone())
+
+        // 1.0 聚合 token_accounts 数据（避免同一个 account 多次更新）
+        let aggregated_accounts = aggregate_token_account_events(synced_events);
+
+        let account_pubkeys: Vec<String> = aggregated_accounts.iter()
+            .map(|a| a.acct_pubkey.clone())
             .collect();
-        let owner_pubkeys: Vec<String> = synced_events.iter()
-            .map(|e| e.owner_pubkey.clone())
+        let mint_pubkeys: Vec<String> = aggregated_accounts.iter()
+            .map(|a| a.mint_pubkey.clone())
             .collect();
-        let mint_pubkeys: Vec<String> = synced_events.iter()
-            .map(|e| e.mint_pubkey.clone())
+        let owner_pubkeys: Vec<String> = aggregated_accounts.iter()
+            .map(|a| a.owner_pubkey.clone())
             .collect();
-        let balances: Vec<String> = synced_events.iter()
-            .map(|e| e.delta.to_string())
+        let balances: Vec<String> = aggregated_accounts.iter()
+            .map(|a| a.delta.to_string())
             .collect();
-        let slots: Vec<i64> = synced_events.iter()
-            .map(|e| e.slot)
+        let slots: Vec<i64> = aggregated_accounts.iter()
+            .map(|a| a.last_updated_slot)
             .collect();
 
-        // 1.1 upsert token_accounts
+        info!("start upserting token_accounts");
+        // 1.1 upsert token_accounts（实时事件的 baseline_slot 为 NULL）
         sqlx::query!(
             r#"
             INSERT INTO token_accounts
-                (acct_pubkey, mint_pubkey, owner_pubkey, balance, last_updated_slot)
-            SELECT acct_pubkey, mint_pubkey, owner_pubkey, balance::numeric, last_updated_slot
+                (acct_pubkey, mint_pubkey, owner_pubkey, balance, baseline_slot, last_updated_slot)
+            SELECT acct_pubkey, mint_pubkey, owner_pubkey, balance::numeric, NULL, last_updated_slot
             FROM UNNEST($1::varchar[], $2::varchar[], $3::varchar[], $4::text[], $5::bigint[])
                 AS t(acct_pubkey, mint_pubkey, owner_pubkey, balance, last_updated_slot)
             ON CONFLICT(acct_pubkey)
@@ -70,6 +90,7 @@ impl AtomicityData for DatabaseConnection{
             .execute(&mut *tx)
             .await?;
         // 1.2 删除 token_accounts中 balance 为 0 的数据
+        info!("start deleting token_account in token_accounts who's balance equals 0");
         sqlx::query!(
             r#"
         DELETE FROM token_accounts
@@ -98,6 +119,7 @@ impl AtomicityData for DatabaseConnection{
             .collect();
 
         // 2.1 upsert holders
+        info!("start upserting holders");
         sqlx::query!(
             r#"
             INSERT INTO holders
@@ -120,6 +142,7 @@ impl AtomicityData for DatabaseConnection{
             .execute(&mut *tx)
             .await?;
         // 2.2 删除 balance 为 0 的数据
+        info!("start deleting holder in holders who's balance equals 0");
         sqlx::query!(
             r#"
         DELETE FROM holders
@@ -130,7 +153,17 @@ impl AtomicityData for DatabaseConnection{
             .execute(&mut *tx)
             .await?;
 
-        // 3. 重新统计 holder_count
+        // 3. 为每个 mint 计算其最大 slot
+        use std::collections::HashMap;
+        let mut mint_max_slots: HashMap<String, i64> = HashMap::new();
+        for event in synced_events {
+            mint_max_slots
+                .entry(event.mint_pubkey.clone())
+                .and_modify(|slot| *slot = (*slot).max(event.slot))
+                .or_insert(event.slot);
+        }
+
+        // 4. 重新统计 holder_count
         let unique_mints: HashSet<String> = synced_events.iter()
             .map(|e| e.mint_pubkey.clone())
             .collect();
@@ -152,22 +185,26 @@ impl AtomicityData for DatabaseConnection{
             holder_counts.push((mint, count));
         }
 
-        // 4. Upsert mint_stats（使用重新统计的值）
-        let (mint_pubkeys, counts): (Vec<String>, Vec<i64>) =
-            holder_counts.into_iter().unzip();
+        // 5. Upsert mint_stats（使用重新统计的值，每个 mint 使用自己的最大 slot）
+        info!("start upserting mint_stats");
 
-        // 找到这批事件的最大 slot
-        let max_slot = synced_events.iter()
-            .map(|e| e.slot)
-            .max()
-            .unwrap_or(0);
+        let mut mint_pubkeys = Vec::new();
+        let mut holder_counts_vec = Vec::new();
+        let mut max_slots = Vec::new();
+
+        for (mint, count) in holder_counts {
+            let max_slot = mint_max_slots.get(&mint).copied().unwrap_or(0);
+            mint_pubkeys.push(mint);
+            holder_counts_vec.push(count);
+            max_slots.push(max_slot);
+        }
 
         sqlx::query!(
           r#"
           INSERT INTO mint_stats (mint_pubkey, holder_count, last_updated_slot)
-          SELECT mint_pubkey, holder_count, $3
-          FROM UNNEST($1::varchar[], $2::bigint[])
-              AS t(mint_pubkey, holder_count)
+          SELECT mint_pubkey, holder_count, last_updated_slot
+          FROM UNNEST($1::varchar[], $2::bigint[], $3::bigint[])
+              AS t(mint_pubkey, holder_count, last_updated_slot)
           ON CONFLICT (mint_pubkey)
           DO UPDATE SET
               holder_count = EXCLUDED.holder_count,
@@ -176,8 +213,8 @@ impl AtomicityData for DatabaseConnection{
           WHERE mint_stats.last_updated_slot < EXCLUDED.last_updated_slot
           "#,
           &mint_pubkeys,
-          &counts,
-          &max_slot,
+          &holder_counts_vec,
+          &max_slots,
       )
             .execute(&mut *tx)
             .await?;
@@ -212,20 +249,21 @@ impl AtomicityData for DatabaseConnection{
             .collect::<Vec<_>>();
         let last_updated_slots: Vec<i64> = token_accounts
             .iter()
-            .map(|token_holder| token_holder.slot as i64)
+            .map(|token_holder| token_holder.slot)
             .collect();
 
         sqlx::query!(
             r#"
             INSERT INTO token_accounts
-                (acct_pubkey, mint_pubkey, owner_pubkey, balance, last_updated_slot)
-            SELECT acct_pubkey, mint_pubkey, owner_pubkey, balance::numeric, last_updated_slot
-            FROM UNNEST($1::varchar[], $2::varchar[], $3::varchar[], $4::text[], $5::bigint[])
-                AS t(acct_pubkey, mint_pubkey, owner_pubkey, balance, last_updated_slot)
+                (acct_pubkey, mint_pubkey, owner_pubkey, balance, baseline_slot, last_updated_slot)
+            SELECT acct_pubkey, mint_pubkey, owner_pubkey, balance::numeric, baseline_slot, last_updated_slot
+            FROM UNNEST($1::varchar[], $2::varchar[], $3::varchar[], $4::text[], $5::bigint[], $6::bigint[])
+                AS t(acct_pubkey, mint_pubkey, owner_pubkey, balance, baseline_slot, last_updated_slot)
             ON CONFLICT(acct_pubkey)
             DO UPDATE SET
                balance = EXCLUDED.balance,
-               last_updated_slot = EXCLUDED.last_updated_slot,
+               baseline_slot = EXCLUDED.baseline_slot,
+                last_updated_slot = EXCLUDED.last_updated_slot,
                updated_at = now()
             WHERE token_accounts.last_updated_slot < EXCLUDED.last_updated_slot
             "#,
@@ -233,6 +271,7 @@ impl AtomicityData for DatabaseConnection{
             &mint_pubkeys,
             &owner_pubkeys,
             &balances,
+            &last_updated_slots,
             &last_updated_slots,
         )
         .execute(&mut *tx)
@@ -270,6 +309,7 @@ impl AtomicityData for DatabaseConnection{
                balance = EXCLUDED.balance,
                last_updated_slot = EXCLUDED.last_updated_slot,
                updated_at = now()
+            WHERE holders.last_updated_slot <= EXCLUDED.last_updated_slot
             "#,
             &holder_mint_pubkeys,
             &holder_owner_pubkeys,
@@ -293,6 +333,7 @@ impl AtomicityData for DatabaseConnection{
                holder_count = EXCLUDED.holder_count,
                last_updated_slot = EXCLUDED.last_updated_slot,
                updated_at = now()
+            WHERE mint_stats.last_updated_slot <= EXCLUDED.last_updated_slot
             "#,
             mint,
             holder_count,

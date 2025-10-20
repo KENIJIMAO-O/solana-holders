@@ -3,9 +3,6 @@ use crate::baseline::getProgramAccounts::HttpClient;
 use crate::database::postgresql::DatabaseConnection;
 use crate::message_queue::token_event_message_queue::Redis;
 use crate::repositories::events::{Event, EventsRepository};
-use crate::repositories::holders::HoldersRepository;
-use crate::repositories::mint_stats::MintStatsRepository;
-use crate::repositories::token_accounts::TokenAccountsRepository;
 use crate::repositories::tracked_mints::TrackedMintsRepository;
 use crate::utils::timer::TaskLogger;
 use rust_decimal::Decimal;
@@ -46,7 +43,7 @@ impl SyncController {
         let consumer_name = "token_event_dequeuer";
 
         loop {
-            let mut logger = TaskLogger::new("sync_controller", "2");
+            let mut logger = TaskLogger::new("sync_controller_events", "2");
 
             tokio::select! {
                 _ = cancellation_token.cancelled() => {
@@ -158,6 +155,10 @@ impl SyncController {
                         if let Err(e) = self.database.upsert_synced_mints_atomic(&synced_token_events).await {
                             error!("upsert token_account, holders, mint_stats error: {}", e);
                         }
+                        // 确认当前events已经使用
+                        self.database.confirm_events(&synced_token_events).await?;
+
+                        logger.log("sql upsert token_account, holders, mint_stats error complete");
                     }
                 }
             }
@@ -177,9 +178,10 @@ impl SyncController {
 
         // 创建信号量控制并发数
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_BASELINE));
+        tokio::time::sleep(Duration::from_secs(10)).await;
 
         loop {
-            let mut logger = TaskLogger::new("sync_controller", "3");
+            let mut logger = TaskLogger::new("sync_controller_baseline", "3");
 
             tokio::select! {
                 // 分支1 收到了取消信息
@@ -208,6 +210,7 @@ impl SyncController {
                     }
 
                     logger.log(&format!("Dequeued {} mints for baseline processing", mints.len()));
+                    info!(" mints' len:{}",  mints.len());
 
                     // 使用 Semaphore 控制并发，spawn 多个任务
                     let mut handles = Vec::new();
@@ -333,6 +336,7 @@ impl SyncController {
     }
 
     pub async fn build_baseline(&self, mint: &str) -> anyhow::Result<i64> {
+        info!("start building baseline for: {}", mint);
         let token_accounts = self.http_client.get_token_holders(mint).await?;
 
         let baseline_slot = if !token_accounts.is_empty() {
@@ -366,16 +370,24 @@ impl SyncController {
                         continue;
                     }
 
+                    info!("In next_cursor to sync mint atomic");
                     self.database.upsert_synced_mints_atomic(&token_events).await?;
+
+                    // 确认当前events已经使用
+                    self.database.confirm_events(&token_events).await?;
+
                     total_processed += token_events.len();
                     cursor = next_cursor;
                 }
                 Ok((token_events, None)) => {
                     // 没有更多历史数据，处理最后一批后退出
+                    info!("In none to sync mint atomic");
                     if !token_events.is_empty() {
                         self.database.upsert_synced_mints_atomic(&token_events).await?;
                         total_processed += token_events.len();
                     }
+                    // 确认当前events已经使用
+                    self.database.confirm_events(&token_events).await?;
 
                     info!("Catch-up completed for mint {}: processed {} events", mint, total_processed);
                     break;

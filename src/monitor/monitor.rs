@@ -306,7 +306,7 @@ impl Monitor {
         monitor_logger.log("start to push events to message queue");
         self.send_events_to_message_queue(all_events, &mut monitor_logger).await?;
 
-        info!("✅ Slot {} 处理完成: 总交易={}, 目标交易={}", block_slot, tx_count, target_tx_count);
+        info!("✅ Slot {} 处理完成: 总交易={}, 目标事件={}", block_slot, tx_count, target_tx_count);
         Ok(())
     }
 

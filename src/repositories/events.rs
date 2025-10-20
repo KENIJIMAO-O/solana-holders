@@ -3,6 +3,7 @@ use crate::utils::timer::TaskLogger;
 use anyhow::{Error, Result, anyhow};
 use rust_decimal::Decimal;
 use sqlx::FromRow;
+use tracing::info;
 use yellowstone_grpc_proto::tonic::async_trait;
 
 
@@ -142,7 +143,48 @@ impl EventsRepository for DatabaseConnection {
     }
 
     async fn confirm_events(&self, events: &[Event]) -> Result<(), Error> {
-        todo!()
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = self.pool.begin().await?;
+
+        // 提取 tx_sig 和 account_pubkey
+        let tx_sigs: Vec<String> = events
+            .iter()
+            .map(|event| event.tx_sig.clone())
+            .collect();
+
+        let account_pubkeys: Vec<String> = events
+            .iter()
+            .map(|event| event.account_pubkey.clone())
+            .collect();
+
+        // 批量更新 confirmed 字段
+        let rows_affected = sqlx::query!(
+            r#"
+            UPDATE events
+            SET confirmed = true
+            FROM UNNEST($1::varchar[], $2::varchar[]) AS t(tx_sig, account_pubkey)
+            WHERE
+                events.tx_sig = t.tx_sig
+                AND events.account_pubkey = t.account_pubkey
+                AND events.confirmed = false
+            "#,
+            &tx_sigs,
+            &account_pubkeys,
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        tx.commit().await?;
+
+        if rows_affected > 0 {
+            info!("Confirmed {} events", rows_affected);
+        }
+
+        Ok(())
     }
 
     /// 从指定的游标 (last_slot, last_id) 开始，获取下一批最新的 events
