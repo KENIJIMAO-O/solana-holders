@@ -1,17 +1,17 @@
-use std::collections::HashSet;
 use crate::baseline::getProgramAccounts::HttpClient;
 use crate::database::postgresql::DatabaseConnection;
 use crate::message_queue::token_event_message_queue::Redis;
+use crate::repositories::AtomicityData;
 use crate::repositories::events::{Event, EventsRepository};
 use crate::repositories::tracked_mints::TrackedMintsRepository;
 use crate::utils::timer::TaskLogger;
 use rust_decimal::Decimal;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
-use crate::repositories::AtomicityData;
 
 #[derive(Clone)]
 pub struct SyncController {
@@ -20,7 +20,6 @@ pub struct SyncController {
     pub http_client: Arc<HttpClient>,
 }
 
-/// todo!: 还有一比较关键的东西没做，就是需要判断一下消息队列的发送端和接收端处理的时候是否需要用到锁
 impl SyncController {
     pub fn new(
         redis: Arc<Redis>,
@@ -171,6 +170,8 @@ impl SyncController {
         &self,
         cancellation_token: CancellationToken,
     ) -> anyhow::Result<()> {
+        // todo!: 这里考虑是否需要全局并发数，将这些配置在.env文件中
+        // todo!: 这里考虑 分离大代币和 小代币，防止大代币长时间占用线程，可以通过创建两个不同的semaphore来实现
         const MAX_CONCURRENT_BASELINE: usize = 10; // 最大并发数
         const DEQUEUE_SIZE: usize = 50; // 批量拉取任务数
         const BATCH_TIMEOUT_MS: u64 = 100;
@@ -210,67 +211,42 @@ impl SyncController {
                     }
 
                     logger.log(&format!("Dequeued {} mints for baseline processing", mints.len()));
-                    info!(" mints' len:{}",  mints.len());
-
-                    // 使用 Semaphore 控制并发，spawn 多个任务
-                    let mut handles = Vec::new();
+                    info!("Dequeued {} mints for baseline processing", mints.len());
 
                     for (message_id, mint) in mints {
-                        let permit = match semaphore.clone().acquire_owned().await {
-                            Ok(p) => p,
-                            Err(e) => {
-                                error!("Failed to acquire semaphore: {}", e);
-                                continue;
-                            }
-                        };
                         let controller = self.clone();
+                        let semaphore_clone = semaphore.clone();
 
-                        let handle = tokio::spawn(async move {
-                            let _permit = permit; // 持有 permit，函数结束时自动释放
+                        tokio::spawn(async move {
+                            // 在任务内部等待semaphore permit，不阻塞主循环
+                            let permit = match semaphore_clone.acquire_owned().await {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    error!("Failed to acquire semaphore for mint {}: {}", mint, e);
+                                    return;  // 直接返回，不继续处理
+                                }
+                            };
+                            let _permit = permit;
 
-                            // 完整的 baseline 处理流程
-                            let result = Self::process_single_baseline(controller, &mint).await;
+                            let result = Self::process_single_baseline(controller.clone(), &mint).await;
 
-                            (message_id, mint, result)
-                        });
-
-                        handles.push(handle);
-                    }
-
-                    // 等待所有任务完成
-                    logger.log("Waiting for all baseline tasks to complete");
-                    let results = futures::future::join_all(handles).await;
-
-                    // 统计成功和失败
-                    let mut success_count = 0;
-                    let mut fail_count = 0;
-
-                    for result in results {
-                        match result {
-                            Ok((message_id, mint, Ok(_))) => {
-                                // 处理成功，ACK 消息
-                                if let Err(e) = self.redis.ack_message_baseline(&message_id).await {
-                                    error!("Failed to ACK message {} for mint {}: {}", message_id, mint, e);
-                                } else {
-                                    info!("✅ Baseline completed for mint: {}", mint);
-                                    success_count += 1;
+                            // 处理完成后立即ACK，不等待其他代币
+                            match result {
+                                Ok(_) => {
+                                    if let Err(e) = controller.redis.ack_message_baseline(&message_id).await {
+                                        error!("Failed to ACK message {} for mint {}: {}", message_id, mint, e);
+                                    } else {
+                                        info!("✅ Baseline completed for mint: {}", mint);
+                                    }
+                                }
+                                Err(e) => {
+                                    // 处理失败，不 ACK，消息留在 PEL 等待重试
+                                    error!("❌ Baseline failed for mint {}: {}", mint, e);
                                 }
                             }
-                            Ok((_message_id, mint, Err(e))) => {
-                                // 处理失败，不 ACK，消息留在 PEL 等待重试
-                                // todo!: 现在有一个问题就是对于USDT/USDC这种有点拉不下来
-                                error!("❌ Baseline failed for mint {}: {}", mint, e);
-                                fail_count += 1;
-                            }
-                            Err(e) => {
-                                // Task panic
-                                error!("⚠️ Baseline task panicked: {}", e);
-                                fail_count += 1;
-                            }
-                        }
+                        });
                     }
-
-                    info!("Baseline batch complete: {} succeeded, {} failed", success_count, fail_count);
+                    // 不等待任务完成，立即进入下一次循环拉取新代币
                 }
             }
         }
@@ -279,10 +255,7 @@ impl SyncController {
     }
 
     /// 处理单个 mint 的完整 baseline 流程
-    async fn process_single_baseline(
-        controller: SyncController,
-        mint: &str,
-    ) -> anyhow::Result<()> {
+    async fn process_single_baseline(controller: SyncController, mint: &str) -> anyhow::Result<()> {
         // 步骤 1: 构建 baseline 数据
         let baseline_slot = match controller.build_baseline(mint).await {
             Ok(slot) => {
@@ -359,10 +332,30 @@ impl SyncController {
         let mut cursor = (baseline_slot - 1, i64::MAX);
         let mut total_processed = 0;
 
-        info!("Starting catch-up for mint {} from slot {}", mint, baseline_slot);
+        info!(
+            "Starting catch-up for mint {} from slot {}",
+            mint, baseline_slot
+        );
+
+        // 在开始处理之前，将 baseline_slot 之前的所有未确认事件标记为 confirmed
+        // 因为 baseline 已经代表了那个时刻的完整状态，这些过时的事件不需要再处理
+        let skipped_count = self
+            .database
+            .confirm_events_before_baseline(mint, baseline_slot)
+            .await?;
+        if skipped_count > 0 {
+            info!(
+                "Skipped {} events before baseline_slot {} for mint {}",
+                skipped_count, baseline_slot, mint
+            );
+        }
 
         loop {
-            match self.database.get_next_events_batch(cursor, mint, BATCH_SIZE).await {
+            match self
+                .database
+                .get_next_events_batch(cursor, mint, BATCH_SIZE)
+                .await
+            {
                 Ok((token_events, Some(next_cursor))) => {
                     // 有更多历史数据，继续处理
                     if token_events.is_empty() {
@@ -371,7 +364,9 @@ impl SyncController {
                     }
 
                     info!("In next_cursor to sync mint atomic");
-                    self.database.upsert_synced_mints_atomic(&token_events).await?;
+                    self.database
+                        .upsert_synced_mints_atomic(&token_events)
+                        .await?;
 
                     // 确认当前events已经使用
                     self.database.confirm_events(&token_events).await?;
@@ -383,13 +378,18 @@ impl SyncController {
                     // 没有更多历史数据，处理最后一批后退出
                     info!("In none to sync mint atomic");
                     if !token_events.is_empty() {
-                        self.database.upsert_synced_mints_atomic(&token_events).await?;
+                        self.database
+                            .upsert_synced_mints_atomic(&token_events)
+                            .await?;
                         total_processed += token_events.len();
                     }
                     // 确认当前events已经使用
                     self.database.confirm_events(&token_events).await?;
 
-                    info!("Catch-up completed for mint {}: processed {} events", mint, total_processed);
+                    info!(
+                        "Catch-up completed for mint {}: processed {} events",
+                        mint, total_processed
+                    );
                     break;
                 }
                 Err(e) => {
@@ -405,15 +405,14 @@ impl SyncController {
 
 #[cfg(test)]
 mod tests {
-    use tracing_subscriber::{fmt, EnvFilter, Layer};
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::util::SubscriberInitExt;
+    use super::*;
     use crate::database::postgresql::DatabaseConfig;
     use crate::message_queue::RedisQueueConfig;
-    use super::*;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::{EnvFilter, Layer, fmt};
 
-
-    fn set_up(){
+    fn set_up() {
         dotenv::dotenv().ok();
         let console_subscriber = fmt::layer()
             .with_target(false)
@@ -422,8 +421,9 @@ mod tests {
         tracing_subscriber::registry()
             .with(
                 console_subscriber.with_filter(
-                    EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| "info,rustls=warn,sqlx=warn,hyper=warn,tokio=warn".into()),
+                    EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                        "info,rustls=warn,sqlx=warn,hyper=warn,tokio=warn".into()
+                    }),
                 ),
             )
             .init();
@@ -450,7 +450,10 @@ mod tests {
 
         let cancellation_token = CancellationToken::new();
         let token = cancellation_token.child_token();
-        if let Err(e) = sync_controller.consume_baseline_mints_for_queue(token).await {
+        if let Err(e) = sync_controller
+            .consume_baseline_mints_for_queue(token)
+            .await
+        {
             error!("Monitor error: {:?}", e);
         }
     }
