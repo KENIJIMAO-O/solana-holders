@@ -1,0 +1,29 @@
+# =========== 对账 ============
+# 默认的对账时间间隔
+default_interval_hours = 72
+
+[[scheduling_tiers]]
+threshold_percent = 100
+interval_hours = 24
+
+[[scheduling_tiers]]
+threshold_percent = 50
+interval_hours = 36
+
+[[scheduling_tiers]]
+threshold_percent = 30
+interval_hours = 72          # 3 days
+
+[[scheduling_tiers]]
+threshold_percent = 10
+interval_hours = 96          # four days
+
+[[scheduling_tiers]]
+threshold_percent = 5
+interval_hours = 168         # a week
+
+# =========== 审计配置 ============
+[audit]
+enabled = true
+# 需要审计的 mint 列表（空数组表示不审计任何 mint）
+tracked_mints = []

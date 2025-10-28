@@ -1,5 +1,6 @@
 use anyhow::{Error, anyhow};
 use deadpool_redis::{Config, Connection as DeadpoolConnection, Pool, Runtime};
+use redis::Client;
 use tracing::info;
 
 // 暂时使用redis作为消息队列来试试
@@ -34,12 +35,13 @@ impl Default for RedisQueueConfig {
 pub struct Redis {
     pub queue_connection_pool: Pool, // 消息队列连接池
     pub redis_queue_config: RedisQueueConfig,
+    pub blocking_queue_client: Client, // 专用于阻塞命令的队列客户端（XREAD BLOCK）
 }
 
 impl Redis {
     /// 创建一个新的 Redis 服务实例，并初始化连接池
     pub async fn new(redis_url: &str, config: RedisQueueConfig) -> anyhow::Result<Self, Error> {
-        // 正确方式：直接将 URL 字符串传给 from_url
+        let blocking_queue_client = Client::open(redis_url)?;
         let cfg = Config::from_url(redis_url);
 
         let pool = cfg
@@ -51,6 +53,7 @@ impl Redis {
         Ok(Self {
             queue_connection_pool: pool,
             redis_queue_config: config,
+            blocking_queue_client
         })
     }
 

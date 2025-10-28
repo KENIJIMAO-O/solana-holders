@@ -11,3 +11,6 @@ verify_slot_consistency.py
 package-lock.json
 package.json
 node_modules
+getProgramAccountsV2.json
+usdc.log
+usdt.json

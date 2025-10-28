@@ -36,7 +36,15 @@ pub struct AccountInfoValue {
 #[derive(Deserialize, Debug)]
 pub struct GetProgramAccountsData {
     context: ContextInfo,
-    value: Vec<ValueInfo>,
+    value: ValueInfo,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ValueInfo {
+    pub accounts: Vec<Account>,
+    pub pagination_key: Option<String>,
+    pub count: Option<usize>
 }
 
 #[derive(Deserialize, Debug)]
@@ -47,7 +55,7 @@ pub struct ContextInfo {
 }
 
 #[derive(Deserialize, Debug)]
-pub struct ValueInfo {
+pub struct Account {
     account: AccountInfo,
     pubkey: String,
 }

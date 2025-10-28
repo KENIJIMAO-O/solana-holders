@@ -6,7 +6,6 @@ use sqlx::FromRow;
 use tracing::info;
 use yellowstone_grpc_proto::tonic::async_trait;
 
-
 pub struct Event {
     pub slot: i64,
     pub tx_sig: String,
@@ -62,7 +61,14 @@ pub trait EventsRepository {
 
     /// 更新confirmed
     async fn confirm_events(&self, events: &[Event]) -> Result<(), Error>;
-    // todo!:更多的repo
+
+    /// 将 baseline_slot 之前的所有未确认事件标记为 confirmed
+    /// 因为 baseline 已经代表了那个时刻的完整状态，这些事件不需要再处理
+    async fn confirm_events_before_baseline(
+        &self,
+        mint: &str,
+        baseline_slot: i64,
+    ) -> Result<u64, Error>;
 
     /// 从指定的游标 (last_slot, last_id) 开始，获取下一批最新的 events
     async fn get_next_events_batch(
@@ -150,10 +156,7 @@ impl EventsRepository for DatabaseConnection {
         let mut tx = self.pool.begin().await?;
 
         // 提取 tx_sig 和 account_pubkey
-        let tx_sigs: Vec<String> = events
-            .iter()
-            .map(|event| event.tx_sig.clone())
-            .collect();
+        let tx_sigs: Vec<String> = events.iter().map(|event| event.tx_sig.clone()).collect();
 
         let account_pubkeys: Vec<String> = events
             .iter()
@@ -187,6 +190,37 @@ impl EventsRepository for DatabaseConnection {
         Ok(())
     }
 
+    /// 将 baseline_slot 之前的所有未确认事件标记为 confirmed
+    async fn confirm_events_before_baseline(
+        &self,
+        mint: &str,
+        baseline_slot: i64,
+    ) -> Result<u64, Error> {
+        let rows_affected = sqlx::query!(
+            r#"
+            UPDATE events
+            SET confirmed = true
+            WHERE mint_pubkey = $1
+              AND slot < $2
+              AND confirmed = false
+            "#,
+            mint,
+            baseline_slot,
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+
+        if rows_affected > 0 {
+            info!(
+                "Marked {} events before baseline (slot < {}) as confirmed for mint {}",
+                rows_affected, baseline_slot, mint
+            );
+        }
+
+        Ok(rows_affected)
+    }
+
     /// 从指定的游标 (last_slot, last_id) 开始，获取下一批最新的 events
     async fn get_next_events_batch(
         &self,
@@ -202,7 +236,7 @@ impl EventsRepository for DatabaseConnection {
             r#"
         SELECT id, slot, tx_sig, mint_pubkey, account_pubkey, owner_pubkey, delta, confirmed
         FROM events
-        WHERE (slot, id) > ($1, $2) AND mint_pubkey = $3
+        WHERE (slot, id) > ($1, $2) AND mint_pubkey = $3 AND confirmed = false
         ORDER BY slot ASC, id ASC
         LIMIT $4
         "#,

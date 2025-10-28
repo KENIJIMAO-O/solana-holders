@@ -109,9 +109,10 @@ impl SyncController {
                     // 将新代币发送到 baseline 消息队列中
                     let mints: Vec<String> = token_events
                         .iter()
-                        .map(|token_event| token_event.mint_pubkey.clone())
-                        .collect::<HashSet<_>>()
+                        .map(|token_event| token_event.mint_pubkey.as_str())
+                        .collect::<HashSet<&str>>()
                         .into_iter()
+                        .map(|s| s.to_string())
                         .collect();
                     let untracked_mints = self.database.is_tracked_batch(&mints).await?;
                     self.redis.batch_enqueue_baseline_task(&untracked_mints).await?;
@@ -172,13 +173,17 @@ impl SyncController {
     ) -> anyhow::Result<()> {
         // todo!: 这里考虑是否需要全局并发数，将这些配置在.env文件中
         // todo!: 这里考虑 分离大代币和 小代币，防止大代币长时间占用线程，可以通过创建两个不同的semaphore来实现
-        const MAX_CONCURRENT_BASELINE: usize = 10; // 最大并发数
+        const MAX_CONCURRENT_BASELINE: usize = 3; // 最大并发执行数
+        const MAX_TASKS_IN_MEMORY: usize = 30; // 内存中最多任务数
         const DEQUEUE_SIZE: usize = 50; // 批量拉取任务数
         const BATCH_TIMEOUT_MS: u64 = 100;
         let consumer_name = "baseline_dequeuer";
 
-        // 创建信号量控制并发数
-        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_BASELINE));
+        // execution_semaphore: 控制同时执行的任务数（10个并发）
+        let execution_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_BASELINE));
+        // memory_semaphore: 控制内存中的任务总数（最多100个任务）
+        let memory_semaphore = Arc::new(Semaphore::new(MAX_TASKS_IN_MEMORY));
+
         tokio::time::sleep(Duration::from_secs(10)).await;
 
         loop {
@@ -211,26 +216,45 @@ impl SyncController {
                     }
 
                     logger.log(&format!("Dequeued {} mints for baseline processing", mints.len()));
-                    info!("Dequeued {} mints for baseline processing", mints.len());
+                    info!("Dequeued {} mints, memory available: {}/{}",
+                        mints.len(),
+                        memory_semaphore.available_permits(),
+                        MAX_TASKS_IN_MEMORY
+                    );
 
                     for (message_id, mint) in mints {
                         let controller = self.clone();
-                        let semaphore_clone = semaphore.clone();
+                        let exec_sem = execution_semaphore.clone();
+                        let mem_sem = memory_semaphore.clone();
+
+                        // 先获取内存permit，如果内存中任务数达到100，主循环会在这里阻塞
+                        // 当某个任务完成时，会释放memory_permit，主循环恢复
+                        let memory_permit = match mem_sem.acquire_owned().await {
+                            Ok(p) => p,
+                            Err(e) => {
+                                error!("Failed to acquire memory semaphore: {}", e);
+                                continue;
+                            }
+                        };
 
                         tokio::spawn(async move {
-                            // 在任务内部等待semaphore permit，不阻塞主循环
-                            let permit = match semaphore_clone.acquire_owned().await {
+                            // 持有memory_permit，任务结束时自动释放
+                            let _mem_permit = memory_permit;
+
+                            // 在任务内部获取执行permit，不阻塞主循环
+                            let exec_permit = match exec_sem.acquire_owned().await {
                                 Ok(p) => p,
                                 Err(e) => {
-                                    error!("Failed to acquire semaphore for mint {}: {}", mint, e);
-                                    return;  // 直接返回，不继续处理
+                                    error!("Failed to acquire execution semaphore for mint {}: {}", mint, e);
+                                    return;
                                 }
                             };
-                            let _permit = permit;
+                            let _exec_permit = exec_permit;
 
+                            // 核心处理
                             let result = Self::process_single_baseline(controller.clone(), &mint).await;
 
-                            // 处理完成后立即ACK，不等待其他代币
+                            // 处理完成后立即ACK
                             match result {
                                 Ok(_) => {
                                     if let Err(e) = controller.redis.ack_message_baseline(&message_id).await {
@@ -240,13 +264,12 @@ impl SyncController {
                                     }
                                 }
                                 Err(e) => {
-                                    // 处理失败，不 ACK，消息留在 PEL 等待重试
                                     error!("❌ Baseline failed for mint {}: {}", mint, e);
                                 }
                             }
+                            // _mem_permit 在这里drop，释放内存槽位
                         });
                     }
-                    // 不等待任务完成，立即进入下一次循环拉取新代币
                 }
             }
         }
@@ -256,6 +279,7 @@ impl SyncController {
 
     /// 处理单个 mint 的完整 baseline 流程
     async fn process_single_baseline(controller: SyncController, mint: &str) -> anyhow::Result<()> {
+        /// todo!: 这里要做的一件事情是先对holder_count进行判断，如果数量大于某个阈值(20万)，则视为big token，使用其他方式获取
         // 步骤 1: 构建 baseline 数据
         let baseline_slot = match controller.build_baseline(mint).await {
             Ok(slot) => {

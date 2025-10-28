@@ -12,9 +12,11 @@ pub mod baseline;
 pub mod database;
 pub mod message_queue;
 pub mod monitor;
+pub mod reconciliation;
 pub mod repositories;
 pub mod sync_controller;
 pub mod utils;
+pub mod test;
 
 pub struct Server;
 
@@ -95,7 +97,10 @@ impl Server {
             let token = cancellation_token.child_token();
             tokio::spawn(async move {
                 debug!("[-] Starting sync controller...");
-                if let Err(e) = sync_controller.consume_baseline_mints_for_queue(token).await {
+                if let Err(e) = sync_controller
+                    .consume_baseline_mints_for_queue(token)
+                    .await
+                {
                     error!("Monitor error: {:?}", e);
                 }
 

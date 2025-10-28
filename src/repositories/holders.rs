@@ -24,7 +24,7 @@ pub fn aggregate_token_holders(token_accounts: &[TokenHolder]) -> Vec<HolderUpse
     // 使用 HashMap 来进行聚合
     // Key: (mint_pubkey, owner_pubkey)
     // Value: (aggregated_balance, max_slot)
-    let mut aggregation_map: HashMap<String, Decimal> = HashMap::new();
+    let mut aggregation_map: HashMap<&str, Decimal> = HashMap::new();
 
     for account in token_accounts {
         let balance = match Decimal::from_str(&account.balance) {
@@ -40,7 +40,7 @@ pub fn aggregate_token_holders(token_accounts: &[TokenHolder]) -> Vec<HolderUpse
 
         // 使用 HashMap 的 entry API，这是最优雅和高效的方式
         let mut entry = aggregation_map
-            .entry(account.owner.clone())
+            .entry(&account.owner)
             .or_insert(Decimal::ZERO); // 如果 key 不存在，则插入一个默认值
 
         // 累加余额
@@ -52,7 +52,7 @@ pub fn aggregate_token_holders(token_accounts: &[TokenHolder]) -> Vec<HolderUpse
         .into_iter()
         .map(|(owner_pubkey, balance)| HolderUpsertData {
             mint_pubkey: token_accounts[0].mint.clone(),
-            owner_pubkey,
+            owner_pubkey: owner_pubkey.to_string(),
             balance,
             last_updated_slot: token_accounts[0].slot,
         })
@@ -73,17 +73,17 @@ pub fn aggregate_events(events: &[Event]) -> Vec<HolderUpsertData> {
 
         entry.0 += delta;
         entry.1 = entry.1.max(event.slot);
-    };
+    }
 
     let results: Vec<HolderUpsertData> = aggregation_map
         .into_iter()
-        .map(|((mint, owner), (delta, lastest_slot))| HolderUpsertData{
+        .map(|((mint, owner), (delta, lastest_slot))| HolderUpsertData {
             mint_pubkey: mint,
             owner_pubkey: owner,
             balance: delta,
-            last_updated_slot:lastest_slot
+            last_updated_slot: lastest_slot,
         })
-    .collect();
+        .collect();
 
     results
 }
@@ -182,8 +182,14 @@ impl HoldersRepository for DatabaseConnection {
             .iter()
             .map(|event| event.owner_pubkey.clone())
             .collect();
-        let deltas: Vec<String> = aggregate_datas.iter().map(|event| event.balance.to_string()).collect();
-        let last_updated_slots: Vec<i64> = aggregate_datas.iter().map(|event| event.last_updated_slot).collect();
+        let deltas: Vec<String> = aggregate_datas
+            .iter()
+            .map(|event| event.balance.to_string())
+            .collect();
+        let last_updated_slots: Vec<i64> = aggregate_datas
+            .iter()
+            .map(|event| event.last_updated_slot)
+            .collect();
 
         let mut tx = self.pool.begin().await?;
 
@@ -291,7 +297,7 @@ mod tests {
     #[test]
     fn test_aggregate_events() {
         let events = vec![
-            Event{
+            Event {
                 slot: 1,
                 tx_sig: "tx1".to_string(),
                 mint_pubkey: "DrZ26cKJDksVRWib3DVVsjo9eeXccc7hKhDJviiYEEZY".to_string(),
@@ -300,7 +306,7 @@ mod tests {
                 delta: Decimal::from_str("1").unwrap(),
                 confirmed: false,
             },
-            Event{
+            Event {
                 slot: 5,
                 tx_sig: "tx2".to_string(),
                 mint_pubkey: "DrZ26cKJDksVRWib3DVVsjo9eeXccc7hKhDJviiYEEZY".to_string(),

@@ -191,8 +191,3 @@ impl TrackedMintsRepository for DatabaseConnection {
         Ok(mints)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-}

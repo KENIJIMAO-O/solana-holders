@@ -1,7 +1,7 @@
 use crate::message_queue::Redis;
 use anyhow::{Error, anyhow};
-use redis::streams::{StreamReadOptions, StreamReadReply};
 use redis::AsyncCommands;
+use redis::streams::{StreamReadOptions, StreamReadReply};
 use tracing::{info, warn};
 
 impl Redis {
@@ -79,7 +79,9 @@ impl Redis {
         block_ms: usize,
     ) -> Result<Vec<(String, String)>, Error> {
         // 1. 获取 Redis 连接
-        let mut conn = self.get_connection().await?;
+        let mut conn = self.blocking_queue_client
+            .get_multiplexed_async_connection()
+            .await?;
         let stream_name = &self.redis_queue_config.baseline_namespace;
         let consumer_group = &self.redis_queue_config.baseline_consumer_group;
 
@@ -102,7 +104,10 @@ impl Redis {
                     Some(value) => value,
                     None => {
                         // 如果消息没有 "mint_pubkey" 字段，说明是无效消息
-                        warn!("Message {} is missing 'mint_pubkey' field. Acknowledging and skipping.", message_id);
+                        warn!(
+                            "Message {} is missing 'mint_pubkey' field. Acknowledging and skipping.",
+                            message_id
+                        );
                         // 无效消息立即 ACK，避免阻塞队列
                         let _ = self.ack_message_baseline(&message_id).await;
                         continue; // 继续处理下一条消息
@@ -117,7 +122,10 @@ impl Redis {
                     }
                     Err(e) => {
                         // 如果值无法解析为 String，同样是无效消息
-                        warn!("Failed to parse mint from message {}: {}. Acknowledging and skipping.", message_id, e);
+                        warn!(
+                            "Failed to parse mint from message {}: {}. Acknowledging and skipping.",
+                            message_id, e
+                        );
                         // 无效消息立即 ACK，避免阻塞队列
                         let _ = self.ack_message_baseline(&message_id).await;
                         continue; // 继续处理下一条消息

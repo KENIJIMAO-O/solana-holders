@@ -22,6 +22,12 @@ pub trait MintStatsRepository {
 
     /// 获取用户holder account数量
     async fn get_holder_account(&self, mint_pubkey: &str) -> Result<i64, Error>;
+
+    /// 批量获取多个 mint 的 holder_count
+    async fn get_holder_counts_batch(
+        &self,
+        mint_pubkeys: &[String],
+    ) -> Result<Vec<(String, i64)>, Error>;
 }
 
 #[async_trait]
@@ -110,6 +116,33 @@ impl MintStatsRepository for DatabaseConnection {
         .await?;
 
         Ok(holder_count)
+    }
+
+    async fn get_holder_counts_batch(
+        &self,
+        mint_pubkeys: &[String],
+    ) -> Result<Vec<(String, i64)>, Error> {
+        if mint_pubkeys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let records = sqlx::query!(
+            r#"
+            SELECT mint_pubkey, holder_count
+            FROM mint_stats
+            WHERE mint_pubkey = ANY($1)
+            "#,
+            mint_pubkeys
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let result = records
+            .into_iter()
+            .map(|record| (record.mint_pubkey, record.holder_count))
+            .collect();
+
+        Ok(result)
     }
 }
 
