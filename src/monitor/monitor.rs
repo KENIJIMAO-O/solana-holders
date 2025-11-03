@@ -1,3 +1,4 @@
+use crate::EVENT_LOG_TARGET;
 use crate::message_queue::token_event_message_queue::Redis;
 use crate::monitor::client::GrpcClient;
 use crate::monitor::utils::constant::{TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID_2022};
@@ -6,7 +7,10 @@ use crate::monitor::utils::utils::{
 };
 use crate::utils::timer::TaskLogger;
 use anyhow::{Error, anyhow};
+use chrono::Local;
+use futures::SinkExt;
 use futures::future::join_all;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use solana_sdk::instruction::CompiledInstruction;
 use solana_sdk::pubkey::Pubkey;
@@ -16,11 +20,12 @@ use spl_token::instruction::TokenInstruction;
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
-use yellowstone_grpc_proto::geyser::CommitmentLevel;
 use yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof;
+use yellowstone_grpc_proto::geyser::{CommitmentLevel, SubscribeRequest, SubscribeRequestPing};
 use yellowstone_grpc_proto::tonic::codegen::tokio_stream::StreamExt;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -76,18 +81,18 @@ impl MonitorConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ReConnectConfig {
-    pub reconnect_count: u8,      // 当前的重连次数
-    max_reconnect_attempts: u8,   // 最大重连次数
-    initial_backoff_seconds: u16, // 初始重连间隔
-    max_backoff_seconds: u16,     // 最大重连间隔
+    reconnect_count: AtomicU32,   // 当前的重连次数
+    max_reconnect_attempts: u32,  // 最大重连次数
+    initial_backoff_seconds: u64, // 初始重连间隔
+    max_backoff_seconds: u64,     // 最大重连间隔
 }
 
 impl Default for ReConnectConfig {
     fn default() -> Self {
         Self {
-            reconnect_count: 0,
+            reconnect_count: AtomicU32::new(0),
             max_reconnect_attempts: 5,
             initial_backoff_seconds: 1,
             max_backoff_seconds: 300,
@@ -95,7 +100,7 @@ impl Default for ReConnectConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Monitor {
     config: MonitorConfig,
     client: GrpcClient,
@@ -131,7 +136,7 @@ impl Monitor {
                 break;
             }
 
-            let reconnect_count = self.reconnect_config.reconnect_count;
+            let reconnect_count = self.reconnect_config.reconnect_count.load(Ordering::SeqCst);
 
             // 检查是否超过最大重连次数
             if reconnect_count >= self.reconnect_config.max_reconnect_attempts {
@@ -145,7 +150,7 @@ impl Monitor {
             // 如果不是第一次连接，需要等待退避时间
             if reconnect_count > 0 {
                 let backoff_seconds = (self.reconnect_config.initial_backoff_seconds
-                    * 2_u16.pow(reconnect_count.saturating_sub(1) as u32))
+                    * 2_u64.pow(reconnect_count.saturating_sub(1)))
                 .min(self.reconnect_config.max_backoff_seconds);
 
                 info!(
@@ -159,7 +164,7 @@ impl Monitor {
                         info!("Monitor cancelled during reconnection backoff");
                         break;
                     }
-                    _ = sleep(Duration::from_secs(backoff_seconds as u64)) => {
+                    _ = sleep(Duration::from_secs(backoff_seconds)) => {
                     }
                 }
             }
@@ -171,8 +176,11 @@ impl Monitor {
                     break;
                 }
                 Err(e) => {
-                    self.reconnect_config.reconnect_count += 1;
-
+                    let current_count = self
+                        .reconnect_config
+                        .reconnect_count
+                        .fetch_add(1, Ordering::SeqCst);
+                    error!("Monitor connection error:{:?}", e);
                     // todo: 分类错误类型
                     ()
                 }
@@ -203,18 +211,14 @@ impl Monitor {
 
         info!("Monitor subscription established, processing blocks");
 
-        self.reconnect_config.reconnect_count = 0;
+        self.reconnect_config
+            .reconnect_count
+            .store(0, Ordering::SeqCst);
 
         // 启动 gRPC 连接监控任务（通过流状态监控）
         let connection_monitor = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
-                // let _ = subscribe_tx
-                //     .send(SubscribeRequest {
-                //         ping: Some(SubscribeRequestPing { id: 1 }),
-                //         ..Default::default()
-                //     })
-                //     .await;
                 interval.tick().await;
                 debug!("🔗 gRPC connection monitor: stream active");
             }
@@ -232,19 +236,49 @@ impl Monitor {
                         Some(Ok(data))=> {
                             if let Some(update) = data.update_oneof{
                                 match update {
+                                    UpdateOneof::Ping(_) => {
+                                        let _ = subscribe_tx
+                                            .send(SubscribeRequest {
+                                            ping: Some(SubscribeRequestPing { id: 1 }),
+                                            ..Default::default()
+                                            })
+                                            .await;
+                                        debug!("service is ping: {:#?}", Local::now());
+                                    }
+                                    UpdateOneof::Pong(_) => {
+                                        debug!("service is pong: {:#?}", Local::now());
+                                    }
                                     UpdateOneof::Block(sub_block) => {
-                                        if let Err(e) = self.process_block(sub_block).await {
-                                            error!("Failed to process block: {}", e);
-                                        }
+                                        let slot = sub_block.slot;
+                                        info!("📥 收到 Slot {}", slot);
+
+                                        let message_queue = Arc::clone(&self.message_queue);
+                                        // 这里可能要添加线程控制
+                                        tokio::spawn(async move {
+                                            let start = std::time::Instant::now();
+
+                                            if let Err(e) = Self::process_block_static(sub_block, message_queue).await {
+                                                error!("Failed to process block {}: {}", slot, e);
+                                            }
+
+                                            let elapsed = start.elapsed();
+                                            info!("🕐 Slot {} 总耗时: {:?}", slot, elapsed);
+                                        });
                                     }
                                     _ => {}
                                 }
                             }
                         }
                         Some(Err(e)) => {
-
+                            error!("Stream error: {:?}", e);
+                            connection_monitor.abort();
+                            return Err(anyhow!("Stream error: {}", e));
                         }
-                        None => {}
+                        None => {
+                            warn!("Monitor stream ended unexpectedly");
+                            connection_monitor.abort();
+                            return Err(anyhow!("Stream ended unexpectedly"));
+                        }
                     }
 
                 }
@@ -261,55 +295,57 @@ impl Monitor {
         &self,
         sub_block: yellowstone_grpc_proto::geyser::SubscribeUpdateBlock,
     ) -> Result<(), Error> {
+        Self::process_block_static(sub_block, Arc::clone(&self.message_queue)).await
+    }
+
+    // 静态版本，用于 spawn
+    async fn process_block_static(
+        sub_block: yellowstone_grpc_proto::geyser::SubscribeUpdateBlock,
+        message_queue: Arc<Redis>,
+    ) -> Result<(), Error> {
         let block_slot = sub_block.slot;
         let tx_count = sub_block.transactions.len();
+        info!("📦 Slot {}: 开始处理 {} 笔交易", block_slot, tx_count);
+
         let mut monitor_logger = TaskLogger::new("monitor logger", "1");
 
         monitor_logger.log("start to handle whole txs in a slot");
         // 并发处理所有交易
-        let tasks: Vec<_> = sub_block
-            .transactions
-            .into_iter()
-            .enumerate()
-            .map(|(tx_index, tx)| {
-                let sig = txn_signature_to_string(tx.signature.clone()).unwrap_or_else(|| {
-                    warn!("Failed to parse transaction signature");
-                    format!("unknown_{}", tx_index)
-                });
+        let transactions = sub_block.transactions; // 将所有权移出
 
-                tokio::spawn(async move {
-                    convert_to_encoded_tx(tx).ok().and_then(|encoded_tx| {
-                        // 使用 block_on 同步执行异步函数
-                        futures::executor::block_on(Self::process_transaction(
-                            encoded_tx,
-                            sig.clone(),
-                            block_slot as i64,
-                        ))
+        // 只创建一个 spawn_blocking 任务，将整个并行计算包裹起来
+        // 使用 Rayon 的 into_par_iter() 来并行处理 transactions
+        let all_events = tokio::task::spawn_blocking(move || {
+            transactions
+                .into_par_iter()
+                .enumerate()
+                .flat_map(|(tx_index, tx)| {
+                    let sig = txn_signature_to_string(tx.signature.clone())
+                        .unwrap_or_else(|| format!("unknown_{}", tx_index));
+
+                    convert_to_encoded_tx(tx)
                         .ok()
-                    })
+                        .and_then(|encoded_tx| {
+                            Self::process_transaction(encoded_tx, sig, block_slot as i64).ok()
+                        })
+                        .unwrap_or_default() // Option<Vec<TokenEvent>> -> Vec<TokenEvent>
                 })
-            })
-            .collect();
-
-        // 等待所有任务完成并收集事件
-        let results = join_all(tasks).await;
-        let mut all_events = Vec::new();
-
-        for result in results {
-            if let Ok(Some(events)) = result {
-                all_events.extend(events);
-            }
-        }
-        let target_tx_count = all_events.len();
+                .collect::<Vec<TokenEvent>>()
+        })
+        .await?;
+        let target_instruction_count = all_events.len();
 
         // 批量发送到消息队列
         monitor_logger.log("start to push events to message queue");
-        self.send_events_to_message_queue(all_events, &mut monitor_logger)
-            .await?;
+        if !all_events.is_empty() {
+            message_queue
+                .batch_enqueue_holder_event(all_events, &mut monitor_logger)
+                .await?;
+        }
 
         info!(
-            "✅ Slot {} 处理完成: 总交易={}, 目标事件={}",
-            block_slot, tx_count, target_tx_count
+            "✅ Slot {} 处理完成: 总交易={}, 目标指令={}",
+            block_slot, tx_count, target_instruction_count
         );
         Ok(())
     }
@@ -328,7 +364,7 @@ impl Monitor {
     }
 
     #[instrument(skip_all)]
-    async fn process_transaction(
+    fn process_transaction(
         transaction: EncodedTransactionWithStatusMeta,
         sig: String,
         block_slot: i64,
@@ -337,6 +373,7 @@ impl Monitor {
             .meta
             .as_ref()
             .ok_or_else(|| anyhow!("无 Meta 数据"))?;
+        debug!(target: EVENT_LOG_TARGET, "slot:{}, sig:{:?}", block_slot, sig);
 
         // 判断当前交易是否成功(如果失败，不做任何动作直接返回)
         if meta.err.is_some() {
@@ -390,40 +427,128 @@ impl Monitor {
             (&meta.pre_token_balances, &meta.post_token_balances)
         {
             // 创建account_index -> post_balance的映射
+            let pre_balance_map: HashMap<u8, _> =
+                pre_balances.iter().map(|b| (b.account_index, b)).collect();
             let post_balance_map: HashMap<u8, _> =
                 post_balances.iter().map(|b| (b.account_index, b)).collect();
 
             let mut instruction_index = 0u32;
 
-            // 直接遍历所有pre_balance，看是否有变化
+            // 处理pre和post都存在代币账户的情况，直接遍历所有pre_balance，看是否有变化
             for pre_balance in pre_balances {
-                if let Some(post_balance) = post_balance_map.get(&pre_balance.account_index) {
-                    // 检查余额是否有变化
-                    if pre_balance.ui_token_amount.ui_amount_string
-                        != post_balance.ui_token_amount.ui_amount_string
-                    {
-                        let delta = subtract_as_decimal(
-                            &post_balance.ui_token_amount.ui_amount_string,
-                            &pre_balance.ui_token_amount.ui_amount_string,
-                        )?;
+                match post_balance_map.get(&pre_balance.account_index) {
+                    // 处理pre和post都存在的情况
+                    Some(post_balance) => {
+                        // 检查余额是否有变化
+                        if pre_balance.ui_token_amount.ui_amount_string
+                            != post_balance.ui_token_amount.ui_amount_string
+                        {
+                            let delta = subtract_as_decimal(
+                                &post_balance.ui_token_amount.ui_amount_string,
+                                &pre_balance.ui_token_amount.ui_amount_string,
+                            )?;
 
-                        let owner = match &pre_balance.owner {
+                            let owner = match &post_balance.owner {
+                                OptionSerializer::Some(owner) => {
+                                    Some(Pubkey::from_str_const(owner))
+                                }
+                                _ => None,
+                            };
+
+                            // 关键：通过account_index获取真实的token account地址
+                            let token_account = *account_keys
+                                .get(pre_balance.account_index as usize)
+                                .ok_or_else(|| {
+                                    anyhow!("Invalid account_index: {}", pre_balance.account_index)
+                                })?;
+
+                            let token_event = TokenEvent {
+                                slot: block_slot,
+                                tx_signature: sig.clone(),
+                                instruction_index,
+                                mint_address: Pubkey::from_str_const(&pre_balance.mint),
+                                account_address: token_account,
+                                owner_address: owner,
+                                delta,
+                                instruction_type: InstructionType::Other, // 简化，不关注具体类型
+                                confirmed: false,
+                            };
+                            events.push(token_event);
+                            instruction_index += 1;
+                        }
+                    }
+                    None => {
+                        // 情况3: 只在 Pre 中存在 - CloseAccount，余额归零
+                        // Delta = 0 - pre_balance (负数)
+                        let pre_amount = &pre_balance.ui_token_amount.ui_amount_string;
+
+                        // 只有当pre余额不为0时才记录
+                        if pre_amount != "0" {
+                            let delta = format!("-{}", pre_amount);
+
+                            let owner = match &pre_balance.owner {
+                                OptionSerializer::Some(owner) => {
+                                    Some(Pubkey::from_str_const(owner))
+                                }
+                                _ => None,
+                            };
+
+                            let token_account = *account_keys
+                                .get(pre_balance.account_index as usize)
+                                .ok_or_else(|| {
+                                    anyhow!("Invalid account_index: {}", pre_balance.account_index)
+                                })?;
+
+                            let token_event = TokenEvent {
+                                slot: block_slot,
+                                tx_signature: sig.clone(),
+                                instruction_index,
+                                mint_address: Pubkey::from_str_const(&pre_balance.mint),
+                                account_address: token_account,
+                                owner_address: owner,
+                                delta,
+                                instruction_type: InstructionType::Other,
+                                confirmed: false,
+                            };
+                            events.push(token_event);
+                            instruction_index += 1;
+                        }
+                    }
+                }
+            }
+
+            // 情况2：遍历所有 post_balances，找只在 Post 中存在的账户
+            // 处理: Post - Pre (新创建的账户或首次接收token)
+            for post_balance in post_balances {
+                if !pre_balance_map.contains_key(&post_balance.account_index) {
+                    // 只在 Post 中存在 - 新账户，余额从0增加
+                    // Delta = post_balance - 0 (正数)
+                    let post_amount = &post_balance.ui_token_amount.ui_amount_string;
+
+                    // 只有当post余额不为0时才记录
+                    if post_amount != "0" {
+                        let delta = post_amount.clone();
+
+                        let owner = match &post_balance.owner {
                             OptionSerializer::Some(owner) => Some(Pubkey::from_str_const(owner)),
                             _ => None,
                         };
 
-                        // 关键：通过account_index获取真实的token account地址
-                        let token_account = account_keys[pre_balance.account_index as usize];
+                        let token_account = *account_keys
+                            .get(post_balance.account_index as usize)
+                            .ok_or_else(|| {
+                                anyhow!("Invalid account_index: {}", post_balance.account_index)
+                            })?;
 
                         let token_event = TokenEvent {
                             slot: block_slot,
                             tx_signature: sig.clone(),
                             instruction_index,
-                            mint_address: Pubkey::from_str_const(&pre_balance.mint),
+                            mint_address: Pubkey::from_str_const(&post_balance.mint),
                             account_address: token_account,
                             owner_address: owner,
                             delta,
-                            instruction_type: InstructionType::Other, // 简化，不关注具体类型
+                            instruction_type: InstructionType::Other,
                             confirmed: false,
                         };
                         events.push(token_event);
@@ -432,72 +557,13 @@ impl Monitor {
                 }
             }
         }
-
         Ok(events)
-    }
-
-    pub fn proccess_instruction(
-        ix: &CompiledInstruction,
-        account_keys: &Vec<Pubkey>,
-    ) -> Result<InstructionType, Error> {
-        if (ix.program_id_index as usize) > account_keys.len() {
-            return Err(anyhow!("Program ID index out of bounds"));
-        }
-
-        let program_id = account_keys[ix.program_id_index as usize];
-        if !program_id.eq(&TOKEN_PROGRAM_ID) && !program_id.eq(&TOKEN_PROGRAM_ID_2022) {
-            return Err(anyhow!("Wrong program ID"));
-        }
-
-        if ix.data.is_empty() {
-            return Err(anyhow!("Empty data"));
-        }
-
-        let account_indexs = &ix.accounts;
-        match TokenInstruction::unpack(&ix.data) {
-            Ok(TokenInstruction::Transfer { amount }) => {
-                let source_account_index = account_indexs[0] as usize;
-                let destination_account_index = account_indexs[1] as usize;
-
-                let source_account = account_keys[source_account_index];
-                let destination_account = account_keys[destination_account_index];
-                Ok(InstructionType::Transfer(
-                    source_account,
-                    source_account_index,
-                    destination_account,
-                    destination_account_index,
-                    amount,
-                ))
-            }
-            Ok(TokenInstruction::TransferChecked { amount, decimals }) => {
-                let source_account = account_keys[account_indexs[0] as usize];
-                let destination_account = account_keys[account_indexs[2] as usize];
-                Ok(InstructionType::TransferChecked(
-                    source_account,
-                    destination_account,
-                    amount,
-                    decimals,
-                ))
-            }
-            Ok(TokenInstruction::MintTo { amount }) => Ok(InstructionType::MintTo()),
-            Ok(TokenInstruction::MintToChecked {
-                amount: u64,
-                decimals: u8,
-            }) => Ok(InstructionType::MintToChecked()),
-            Ok(TokenInstruction::Burn { amount }) => Ok(InstructionType::Burn()),
-            Ok(TokenInstruction::BurnChecked {
-                amount: u64,
-                decimals: u8,
-            }) => Ok(InstructionType::BurnChecked()),
-            _ => Ok(InstructionType::Other),
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::baseline::getProgramAccounts::HttpClient;
     use crate::message_queue::token_event_message_queue::RedisQueueConfig;
 
     #[tokio::test]
@@ -526,5 +592,70 @@ mod tests {
         let token = cancellation_token.child_token();
 
         let result = onchain_monitor.run_with_reconnect(token).await;
+    }
+
+    /// 测试纯粹的gRPC slot接收速度，不做任何处理
+    /// 用于排查是gRPC本身慢还是处理逻辑慢
+    #[tokio::test]
+    async fn test_grpc_slot_receive_speed() {
+        dotenv::dotenv().ok();
+        let monitor_config = MonitorConfig::new();
+        let rpc_url = env::var("GRPC_URL").unwrap();
+        let client = GrpcClient::new(&rpc_url);
+
+        let token_program = TOKEN_PROGRAM_ID.to_string();
+        let token_program_2022 = TOKEN_PROGRAM_ID_2022.to_string();
+        let targets = vec![token_program, token_program_2022];
+
+        println!("🔌 正在连接 gRPC...");
+        let (mut subscribe_tx, mut stream) = client
+            .subscribe_block(targets, Some(true), None, monitor_config.commitment)
+            .await
+            .unwrap();
+
+        println!("✅ gRPC 连接成功，开始接收 slot（只打印，不做任何处理）");
+        println!("📊 Commitment: {:?}", monitor_config.commitment);
+
+        let mut last_slot = 0u64;
+
+        loop {
+            if let Some(Ok(data)) = stream.next().await {
+                if let Some(update) = data.update_oneof {
+                    match update {
+                        UpdateOneof::Ping(_) => {
+                            let _ = subscribe_tx
+                                .send(SubscribeRequest {
+                                    ping: Some(SubscribeRequestPing { id: 1 }),
+                                    ..Default::default()
+                                })
+                                .await;
+                        }
+                        UpdateOneof::Block(sub_block) => {
+                            let now = Local::now().format("%H:%M:%S%.3f");
+                            let slot = sub_block.slot;
+                            let slot_diff = if last_slot > 0 {
+                                slot.saturating_sub(last_slot)
+                            } else {
+                                0
+                            };
+
+                            if slot_diff > 1 {
+                                println!(
+                                    "[{}] ⚠️  Slot {} (跳过了 {} 个slot)",
+                                    now,
+                                    slot,
+                                    slot_diff - 1
+                                );
+                            } else {
+                                println!("[{}] 📥 Slot {}", now, slot);
+                            }
+
+                            last_slot = slot;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
 }

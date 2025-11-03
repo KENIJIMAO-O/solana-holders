@@ -71,6 +71,50 @@ impl GrpcClient {
         Ok((subscribe_tx, stream))
     }
 
+    pub async fn subscribe_transaction(
+        &self,
+        account_include: Vec<String>,  // 包含在内的地址相关交易都会收到
+        account_exclude: Vec<String>,  // 不包含这些地址的相关交易都会收到
+        account_required: Vec<String>, // 必须要包含的地址
+        commitment: CommitmentLevel,
+    ) -> Result<impl Stream<Item = Result<SubscribeUpdate, Status>>> {
+        // client
+        let mut client = GeyserGrpcClient::build_from_shared(self.endpoint.clone())?
+            .tls_config(ClientTlsConfig::new().with_native_roots())?
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
+            .connect()
+            .await?;
+
+        // 过滤规则
+        let mut transactions: TransactionsFilterMap = HashMap::new();
+        transactions.insert(
+            "client".to_string(),
+            SubscribeRequestFilterTransactions {
+                vote: Some(false),
+                failed: Some(false),
+                signature: None,
+                account_include,
+                account_exclude,
+                account_required,
+            },
+        );
+
+        // request
+        let subscribe_request = SubscribeRequest {
+            transactions,
+            commitment: Some(commitment.into()),
+            ..Default::default()
+        };
+
+        // 返回流
+        let (_, stream) = client
+            .subscribe_with_request(Some(subscribe_request))
+            .await?;
+
+        Ok(stream)
+    }
+
     // grpc订阅最新交易哈希
     pub async fn get_latest_blockhash(&self) -> Result<String> {
         let mut client = GeyserGrpcClient::build_from_shared(self.endpoint.clone())?
@@ -89,7 +133,12 @@ impl GrpcClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::monitor::utils::constant::{TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID_2022};
+    use crate::monitor::utils::utils::txn_signature_to_string;
+    use chrono::Local;
     use std::env;
+    use yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof;
+    use yellowstone_grpc_proto::tonic::codegen::tokio_stream::StreamExt;
 
     /// 创建测试用的GrpcClient
     fn create_test_grpc_client() -> GrpcClient {
@@ -126,5 +175,102 @@ mod tests {
         assert_eq!(concurrent_map.get("processed_blocks"), Some(&100));
         assert_eq!(concurrent_map.get("processed_transactions"), Some(&500));
         assert_eq!(concurrent_map.len(), 2);
+    }
+
+    /// 测试subscribe_transaction订阅TOKEN_PROGRAM相关交易
+    /// 只打印基本信息，不做处理，用于测试gRPC交易订阅速度
+    /// 统计每个区块中收到的交易数量
+    #[tokio::test]
+    async fn test_subscribe_token_transactions() {
+        dotenv::dotenv().ok();
+        let client = create_test_grpc_client();
+
+        // 订阅TOKEN_PROGRAM_ID和TOKEN_PROGRAM_ID_2022
+        let account_include = vec![
+            TOKEN_PROGRAM_ID.to_string(),
+            TOKEN_PROGRAM_ID_2022.to_string(),
+        ];
+
+        println!("🔌 正在连接 gRPC 订阅交易...");
+        println!("📋 订阅账户: {:?}", account_include);
+
+        let mut stream = client
+            .subscribe_transaction(
+                account_include,
+                vec![], // account_exclude
+                vec![], // account_required
+                CommitmentLevel::Confirmed,
+            )
+            .await
+            .unwrap();
+
+        println!("✅ gRPC 订阅成功，开始接收交易（只打印，不做任何处理）");
+
+        let mut tx_count = 0u64;
+        let start_time = std::time::Instant::now();
+
+        // 统计每个slot的交易数量
+        let mut slot_tx_count: HashMap<u64, u64> = HashMap::new();
+        let mut last_slot = 0u64;
+
+        loop {
+            if let Some(Ok(data)) = stream.next().await {
+                if let Some(update) = data.update_oneof {
+                    match update {
+                        UpdateOneof::Transaction(tx) => {
+                            tx_count += 1;
+                            let now = Local::now().format("%H:%M:%S%.3f");
+
+                            let slot = tx.slot;
+                            let signature = txn_signature_to_string(
+                                tx.transaction.as_ref().unwrap().signature.clone(),
+                            )
+                            .unwrap_or_else(|| "unknown".to_string());
+
+                            // 更新当前slot的交易计数
+                            *slot_tx_count.entry(slot).or_insert(0) += 1;
+
+                            // 如果切换到新的slot，打印上一个slot的统计
+                            if last_slot > 0 && slot != last_slot {
+                                let last_slot_tx_count =
+                                    slot_tx_count.get(&last_slot).copied().unwrap_or(0);
+                                println!(
+                                    "📦 Slot {} 完成: 共收到 {} 笔交易",
+                                    last_slot, last_slot_tx_count
+                                );
+                            }
+
+                            // println!(
+                            //     "[{}] 📨 交易 #{} | Slot: {} | Sig: {}...{}",
+                            //     now,
+                            //     tx_count,
+                            //     slot,
+                            //     &signature[..8],
+                            //     &signature[signature.len()-8..]
+                            // );
+
+                            last_slot = slot;
+
+                            // 每100笔统计一次速度
+                            if tx_count % 100 == 0 {
+                                let elapsed = start_time.elapsed().as_secs_f64();
+                                let tps = tx_count as f64 / elapsed;
+                                println!(
+                                    "📊 统计: 总交易={}, 耗时={:.2}s, 平均速度={:.2}tx/s",
+                                    tx_count, elapsed, tps
+                                );
+                            }
+                        }
+                        UpdateOneof::Ping(_) => {
+                            println!("🏓 收到 Ping");
+                        }
+                        UpdateOneof::Pong(_) => {
+                            println!("🏓 收到 Pong");
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
 }
