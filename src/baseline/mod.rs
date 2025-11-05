@@ -1,6 +1,54 @@
 use serde::Deserialize;
+use std::time::Duration;
 
 pub mod getProgramAccounts;
+pub mod token_meta;
+
+#[derive(Clone, Debug)]
+pub struct HttpClient {
+    rpc_url: String,
+    sol_scan_token: String,
+    http_client: reqwest::Client,
+}
+
+impl HttpClient {
+    pub fn new(rpc_url: String, sol_scan_token: String) -> anyhow::Result<Self> {
+        let http_client = reqwest::Client::builder()
+            .pool_max_idle_per_host(20)
+            .pool_idle_timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(1600))
+            .tcp_keepalive(Duration::from_secs(30))
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to create batch HTTP client: {}", e))?;
+        Ok(Self {
+            rpc_url,
+            sol_scan_token,
+            http_client,
+        })
+    }
+}
+
+impl Default for HttpClient {
+    fn default() -> Self {
+        let rpc_url = std::env::var("RPC_URL").unwrap();
+        let sol_scan_token = std::env::var("SOLSCAN_API_KEY").unwrap();
+        let http_client = reqwest::Client::builder()
+            .pool_max_idle_per_host(20)
+            .pool_idle_timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(1600))
+            .tcp_keepalive(Duration::from_secs(30))
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to create batch HTTP client: {}", e))
+            .unwrap();
+        Self {
+            rpc_url,
+            sol_scan_token,
+            http_client,
+        }
+    }
+}
 
 #[derive(Deserialize, Debug)]
 pub struct GetAccountInfoData {
@@ -35,16 +83,36 @@ pub struct AccountInfoValue {
 
 #[derive(Deserialize, Debug)]
 pub struct GetProgramAccountsData {
-    context: ContextInfo,
-    value: ValueInfo,
+    pub context: ContextInfo,
+    pub value: ValueInfo,
+}
+
+// 使用 untagged enum 来兼容两种不同的 RPC 响应格式
+#[derive(Deserialize, Debug)]
+#[serde(untagged)]
+pub enum ValueInfo {
+    // Helius V2 格式：value 是一个对象，包含 accounts/pagination_key/count
+    V2(V2Value),
+    // 原生 getProgramAccounts 格式：value 直接就是 Account 数组
+    Legacy(Vec<Account>),
 }
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
-pub struct ValueInfo {
+pub struct V2Value {
     pub accounts: Vec<Account>,
     pub pagination_key: Option<String>,
-    pub count: Option<usize>
+    pub count: Option<usize>,
+}
+
+impl GetProgramAccountsData {
+    // 提供统一的访问方法，无论是哪种格式都返回 accounts
+    pub fn accounts(&self) -> &[Account] {
+        match &self.value {
+            ValueInfo::V2(v2) => &v2.accounts,
+            ValueInfo::Legacy(accounts) => accounts,
+        }
+    }
 }
 
 #[derive(Deserialize, Debug)]

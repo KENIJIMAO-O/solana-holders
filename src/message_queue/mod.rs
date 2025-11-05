@@ -53,7 +53,7 @@ impl Redis {
         Ok(Self {
             queue_connection_pool: pool,
             redis_queue_config: config,
-            blocking_queue_client
+            blocking_queue_client,
         })
     }
 

@@ -255,6 +255,38 @@ impl AtomicityData for DatabaseConnection {
         )
         .await?;
 
+        // 7. 确认所有处理完成的 events（将 confirmed 设置为 true）
+        info!("start confirming events");
+        let event_tx_sigs: Vec<String> = synced_events
+            .iter()
+            .map(|event| event.tx_sig.clone())
+            .collect();
+        let event_account_pubkeys: Vec<String> = synced_events
+            .iter()
+            .map(|event| event.account_pubkey.clone())
+            .collect();
+
+        let rows_affected = sqlx::query!(
+            r#"
+            UPDATE events
+            SET confirmed = true
+            FROM UNNEST($1::varchar[], $2::varchar[]) AS t(tx_sig, account_pubkey)
+            WHERE
+                events.tx_sig = t.tx_sig
+                AND events.account_pubkey = t.account_pubkey
+                AND events.confirmed = false
+            "#,
+            &event_tx_sigs,
+            &event_account_pubkeys,
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        if rows_affected > 0 {
+            info!("Confirmed {} events in atomic transaction", rows_affected);
+        }
+
         tx.commit().await?;
         Ok(())
     }
@@ -375,5 +407,24 @@ impl AtomicityData for DatabaseConnection {
 
         tx.commit().await?;
         Ok(baseline_slot)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use tracing::{Level, debug, event, span};
+    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
+
+    #[test]
+    fn test_span() {
+        tracing_subscriber::registry().with(fmt::layer()).init();
+
+        let span = span!(Level::TRACE, "my_span");
+        let enter = span.enter();
+        println!("wuxizhizhenshuai1");
+        event!(Level::DEBUG, "something happened inside my_span");
+        info!("something happened inside my_span");
+        debug!("Alex wu");
     }
 }

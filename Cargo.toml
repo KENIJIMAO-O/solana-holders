@@ -11,6 +11,7 @@ dotenv = "0.15.0"
 anyhow = "1.0.100"
 
 # 异步
+rayon = "1.11.0"
 tokio = { version = "1.45", features = ["full"] }
 tokio-util = "0.7.16"
 futures = "0.3.31"
@@ -20,15 +21,18 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 # 日志
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+tracing-appender = { version = "0.2.3" }
 
 # 浮点数处理
 rust_decimal = { version = "1.35", features = ["serde-str"] }
 
 #数据库
+rdkafka = { version = "0.38.0", features = ["cmake-build"] }
 redis = { version = "0.32.6", features = ["tokio-comp"] }
 deadpool-redis = "0.22.0"
 sqlx = { version = "0.8.6",features = ["postgres", "runtime-tokio-rustls","macros","chrono", "rust_decimal"]}
 chrono = "0.4"
+clickhouse = "0.12.2"
 
 # solana链上交互
 solana-client = "2.2.7"
@@ -46,3 +50,5 @@ yellowstone-grpc-proto = "6.1.0"
 config = { version = "0.15.18", features = ["toml"] }
 serde_json = "1.0.145"
 serde = { version = "1.0.227", features = ["derive"] }
+clap = "4.5.50"
+rand = "0.8.5"

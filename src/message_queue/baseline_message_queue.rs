@@ -37,8 +37,8 @@ impl Redis {
                         "Failed to create consumer group '{}' for stream '{}': {}",
                         config.baseline_consumer_group, stream_name, error_msg
                     );
+                    return Err(Error::from(e));
                 }
-                return Err(Error::from(e));
             }
         };
 
@@ -79,7 +79,8 @@ impl Redis {
         block_ms: usize,
     ) -> Result<Vec<(String, String)>, Error> {
         // 1. 获取 Redis 连接
-        let mut conn = self.blocking_queue_client
+        let mut conn = self
+            .blocking_queue_client
             .get_multiplexed_async_connection()
             .await?;
         let stream_name = &self.redis_queue_config.baseline_namespace;

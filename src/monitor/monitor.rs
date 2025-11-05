@@ -12,11 +12,9 @@ use futures::SinkExt;
 use futures::future::join_all;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use solana_sdk::instruction::CompiledInstruction;
 use solana_sdk::pubkey::Pubkey;
 use solana_transaction_status_client_types::EncodedTransactionWithStatusMeta;
 use solana_transaction_status_client_types::option_serializer::OptionSerializer;
-use spl_token::instruction::TokenInstruction;
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
@@ -83,10 +81,10 @@ impl MonitorConfig {
 
 #[derive(Debug)]
 pub struct ReConnectConfig {
-    reconnect_count: AtomicU32,   // 当前的重连次数
-    max_reconnect_attempts: u32,  // 最大重连次数
-    initial_backoff_seconds: u64, // 初始重连间隔
-    max_backoff_seconds: u64,     // 最大重连间隔
+    pub(crate) reconnect_count: AtomicU32,   // 当前的重连次数
+    pub(crate) max_reconnect_attempts: u32,  // 最大重连次数
+    pub(crate) initial_backoff_seconds: u64, // 初始重连间隔
+    pub(crate) max_backoff_seconds: u64,     // 最大重连间隔
 }
 
 impl Default for ReConnectConfig {

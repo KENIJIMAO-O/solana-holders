@@ -112,6 +112,7 @@ impl TrackedMintsRepository for DatabaseConnection {
         Ok(())
     }
 
+    // 筛选出已经存在于tracked_mint表中的所有mint
     async fn is_tracked_batch(&self, mint_pubkeys: &[String]) -> Result<Vec<String>, Error> {
         if mint_pubkeys.is_empty() {
             return Ok(vec![]);
@@ -142,6 +143,7 @@ impl TrackedMintsRepository for DatabaseConnection {
         Ok(untracked_mints)
     }
 
+    // 批量将代币状态置为synced
     async fn filter_synced_mints(&self, mint_pubkeys: &[String]) -> Result<Vec<String>, Error> {
         if mint_pubkeys.is_empty() {
             return Ok(vec![]);

@@ -116,12 +116,12 @@ impl Redis {
         block_ms: usize,
         logger: &mut TaskLogger,
     ) -> Result<Vec<(String, TokenEvent)>, Error> {
-        logger.log("start to getting connection");
+        logger.debug("start to getting connection");
         let mut conn = self.get_connection().await?;
         let stream_name = &self.redis_queue_config.token_event_namespace;
         let consumer_group = &self.redis_queue_config.token_event_consumer_group;
 
-        logger.log("start to batch reading");
+        logger.debug("start to batch reading");
 
         let opts = StreamReadOptions::default()
             .group(&consumer_group, consumer_name)
@@ -130,7 +130,7 @@ impl Redis {
         let results: StreamReadReply = conn.xread_options(&[stream_name], &[">"], &opts).await?;
         let mut events = Vec::new();
 
-        logger.log("start to parsing data");
+        logger.debug("start to parsing data");
         // 解析 Redis Stream 返回的数据
         for stream_key in results.keys {
             for stream_id in stream_key.ids {
@@ -153,7 +153,7 @@ impl Redis {
             }
         }
 
-        logger.log("start to renewing statistic");
+        logger.debug("start to renewing statistic");
         // 更新统计
         if !events.is_empty() {
             let stats_key = format!("{}:stats:dequeued", stream_name);

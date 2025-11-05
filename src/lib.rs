@@ -1,24 +1,27 @@
-use crate::baseline::getProgramAccounts::HttpClient;
+use crate::baseline::HttpClient;
 use crate::database::postgresql::{DatabaseConfig, DatabaseConnection};
 use crate::message_queue::token_event_message_queue::{Redis, RedisQueueConfig};
 use crate::monitor::client::GrpcClient;
 use crate::monitor::monitor::{Monitor, MonitorConfig, ReConnectConfig};
+use crate::monitor::new_monitor::NewMonitor;
 use crate::sync_controller::sync_controller::SyncController;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
+use crate::kafka::{KafkaMessageQueue, KafkaQueueConfig};
 
 pub mod baseline;
 pub mod database;
+pub mod kafka;
 pub mod message_queue;
 pub mod monitor;
 pub mod reconciliation;
 pub mod repositories;
 pub mod sync_controller;
 pub mod utils;
-pub mod test;
-
 pub struct Server;
+
+pub const EVENT_LOG_TARGET: &str = "my_app::event_log";
 
 impl Server {
     pub async fn run(&self) -> Result<(), anyhow::Error> {
@@ -28,13 +31,26 @@ impl Server {
         let grpc_client = GrpcClient::new(std::env::var("GRPC_URL").unwrap().as_str());
 
         // 创建消息队列
-        let redis_url = std::env::var("REDIS_URL");
-        let config = RedisQueueConfig::default();
-        let message_queue = Arc::new(Redis::new(&redis_url.unwrap(), config).await.unwrap());
-        let _ = message_queue.initialize_message_queue().await.unwrap();
-        let _ = message_queue.init_baseline_queue().await.unwrap();
+        // let redis_url = std::env::var("REDIS_URL");
+        // let config = RedisQueueConfig::default();
+        // let message_queue = Arc::new(Redis::new(&redis_url.unwrap(), config).await.unwrap());
+        // let _ = message_queue.initialize_message_queue().await.unwrap();
+        // let _ = message_queue.init_baseline_queue().await.unwrap();
+        //
+        // let mut onchain_monitor = Monitor::new(
+        //     monitor_config,
+        //     grpc_client,
+        //     message_queue.clone(),
+        //     reconnect_config,
+        // );
 
-        let onchain_monitor = Monitor::new(
+        let kafka_queue_config = KafkaQueueConfig::default();
+        let message_queue = Arc::new(KafkaMessageQueue::new(kafka_queue_config).unwrap());
+        println!("monitor_config:{:?}", monitor_config);
+        println!("grpc_client:{:?}", grpc_client);
+        // println!("message_queue:{:?}", message_queue);
+        println!("reconnect_config:{:?}", reconnect_config);
+        let mut onchain_monitor = NewMonitor::new(
             monitor_config,
             grpc_client,
             message_queue.clone(),
@@ -58,11 +74,10 @@ impl Server {
             }
         });
         let monitor = {
-            let mut monitor = onchain_monitor.clone();
             let token = cancellation_token.child_token();
             tokio::spawn(async move {
                 debug!("[-] Starting on-chain monitoring with auto-reconnect...");
-                if let Err(e) = monitor.run_with_reconnect(token).await {
+                if let Err(e) = onchain_monitor.run_with_reconnect(token).await {
                     error!("Monitor error: {:?}", e);
                 }
                 debug!("Monitor completed");
@@ -75,8 +90,7 @@ impl Server {
         let database_config = DatabaseConfig::new_optimized(db_url);
         let database = Arc::new(DatabaseConnection::new(database_config).await.unwrap());
 
-        let http_rpc = std::env::var("RPC_URL").unwrap();
-        let http_client = Arc::new(HttpClient::new(http_rpc).unwrap());
+        let http_client = Arc::new(HttpClient::default());
 
         let sync_controller =
             SyncController::new(message_queue.clone(), database.clone(), http_client.clone());
@@ -109,6 +123,7 @@ impl Server {
         };
 
         let results = tokio::join!(monitor, sync_controller_events, sync_controller_baseline);
+        // let results = tokio::join!(monitor);
 
         // 检查任务结果
         if let Err(e) = results.0 {

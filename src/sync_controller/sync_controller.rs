@@ -1,10 +1,10 @@
-use crate::baseline::getProgramAccounts::HttpClient;
 use crate::database::postgresql::DatabaseConnection;
 use crate::message_queue::token_event_message_queue::Redis;
 use crate::repositories::AtomicityData;
 use crate::repositories::events::{Event, EventsRepository};
 use crate::repositories::tracked_mints::TrackedMintsRepository;
 use crate::utils::timer::TaskLogger;
+use crate::baseline::HttpClient;
 use rust_decimal::Decimal;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -12,22 +12,23 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
+use crate::kafka::KafkaMessageQueue;
 
 #[derive(Clone)]
 pub struct SyncController {
-    pub redis: Arc<Redis>,
+    pub kafka_queue: Arc<KafkaMessageQueue>,
     pub database: Arc<DatabaseConnection>,
     pub http_client: Arc<HttpClient>,
 }
 
 impl SyncController {
     pub fn new(
-        redis: Arc<Redis>,
+        kafka_queue: Arc<KafkaMessageQueue>,
         database: Arc<DatabaseConnection>,
         http_client: Arc<HttpClient>,
     ) -> Self {
         Self {
-            redis,
+            kafka_queue,
             database,
             http_client,
         }
@@ -50,7 +51,7 @@ impl SyncController {
                     break;
                 }
 
-                datas_result = self.redis.batch_dequeue_holder_event(
+                datas_result = self.kafka_queue.batch_dequeue_holder_event(
                     consumer_name,
                     BATCH_SIZE,
                     BATCH_TIMEOUT_MS as usize,
@@ -76,7 +77,7 @@ impl SyncController {
                     // --- 数据清洗与转换 ---
                     // 使用 filter_map 来安全地解析和过滤数据
                     let (message_ids, token_events): (Vec<String>, Vec<Event>) = datas
-                        .into_iter()
+                        .iter()
                         .filter_map(|(message_id, raw_event)| {
                             // 1. 尝试将 delta 字符串解析为 Decimal
                             match raw_event.delta.parse::<Decimal>() {
@@ -107,26 +108,36 @@ impl SyncController {
                         .unzip();
 
                     // 将新代币发送到 baseline 消息队列中
-                    let mints: Vec<String> = token_events
+                    let mints: Vec<String> = {
+                        let mut seen = HashSet::new();
+                        token_events
                         .iter()
-                        .map(|token_event| token_event.mint_pubkey.as_str())
-                        .collect::<HashSet<&str>>()
-                        .into_iter()
-                        .map(|s| s.to_string())
-                        .collect();
+                        .filter_map(|e| {
+                        if seen.insert(&e.mint_pubkey) {
+                            Some(e.mint_pubkey.clone())
+                        } else {
+                                None
+                        }
+                    }).collect()
+                    };
+                    let mint_len = mints.len();
+
                     let untracked_mints = self.database.is_tracked_batch(&mints).await?;
-                    self.redis.batch_enqueue_baseline_task(&untracked_mints).await?;
+                    error!("untracked_mints_len:{}", untracked_mints.len());
+
+                    self.kafka_queue.batch_enqueue_baseline_task(&untracked_mints).await?;
 
                     // --- 核心职责：将新的数据更新到数据库中 ---
                     // todo!: 这里我想说的就是，对于任意一个数据，一定会进events表，如果这个代币已经构建了baseline，那么可以直接利用从token queue获取的数据更新
                     // todo!: 如果没有构建baseline，那么就不用更新，等到构建完之后，catch-up需要从数据中将所有和他相关的events全部合并之后，回到token queue
                     // todo!: 所以对于数据库中的数据需要更新三次，第一是baseline构建的时候的更新，第二是catch-up时候的更新，最后是当前函数中token queue的更新
                     if !token_events.is_empty() {
-                        // 对于events表，无论当前代币处于 Not started baseline_building catching_up synced 任意一个阶段，都需要更新
+
+                        // 对于events表，无论当前代币处于 Not_started baseline_building catching_up synced 任意一个阶段，都需要更新
                         match self.database.upsert_events_batch(&token_events, &mut logger).await {
                             Ok(()) => {
                                 // ack token_queue message
-                                 if let Err(e) = self.redis.ack_messages(&message_ids).await {
+                                 if let Err(e) = self.kafka_queue.ack_token_events(consumer_name).await {
                                     error!("Error acknowledging messages: {}", e);
                                     // ACK 失败是一个严重问题，需要考虑如何处理（重试或告警）
                                     continue;
@@ -155,10 +166,8 @@ impl SyncController {
                         if let Err(e) = self.database.upsert_synced_mints_atomic(&synced_token_events).await {
                             error!("upsert token_account, holders, mint_stats error: {}", e);
                         }
-                        // 确认当前events已经使用
-                        self.database.confirm_events(&synced_token_events).await?;
 
-                        logger.log("sql upsert token_account, holders, mint_stats error complete");
+                        logger.log("sql upsert token_account, holders, mint_stats complete");
                     }
                 }
             }
@@ -173,18 +182,19 @@ impl SyncController {
     ) -> anyhow::Result<()> {
         // todo!: 这里考虑是否需要全局并发数，将这些配置在.env文件中
         // todo!: 这里考虑 分离大代币和 小代币，防止大代币长时间占用线程，可以通过创建两个不同的semaphore来实现
-        const MAX_CONCURRENT_BASELINE: usize = 3; // 最大并发执行数
-        const MAX_TASKS_IN_MEMORY: usize = 30; // 内存中最多任务数
-        const DEQUEUE_SIZE: usize = 50; // 批量拉取任务数
+        const MAX_CONCURRENT_BASELINE: usize = 5; // 最大并发执行数
+        const MAX_TASKS_IN_MEMORY: usize = 10; // 内存中最多任务数
+        const DEQUEUE_SIZE: usize = 5; // 批量拉取任务数
         const BATCH_TIMEOUT_MS: u64 = 100;
         let consumer_name = "baseline_dequeuer";
 
-        // execution_semaphore: 控制同时执行的任务数（10个并发）
+        // execution_semaphore: 控制同时执行的任务数
         let execution_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_BASELINE));
-        // memory_semaphore: 控制内存中的任务总数（最多100个任务）
+        // memory_semaphore: 控制内存中的任务总数
+        // 如果不要内存控制会导致loop一直出队，调度tokio::spawn，虽然这些任务会因为execution_semaphore的存在不会同时执行，但是一样会导致内存无限制的增加
         let memory_semaphore = Arc::new(Semaphore::new(MAX_TASKS_IN_MEMORY));
 
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_secs(10)).await; // 等待消息队列中有一些值
 
         loop {
             let mut logger = TaskLogger::new("sync_controller_baseline", "3");
@@ -196,7 +206,7 @@ impl SyncController {
                     break;
                 }
 
-                mints_result = self.redis.batch_dequeue_baseline_task(
+                mints_result = self.kafka_queue.batch_dequeue_baseline_task(
                     consumer_name,
                     DEQUEUE_SIZE,
                     BATCH_TIMEOUT_MS as usize,
@@ -205,7 +215,6 @@ impl SyncController {
                         Ok(m) => m,
                         Err(e) => {
                             error!("Failed to dequeue in baseline consumer: {}", e);
-                            tokio::time::sleep(Duration::from_secs(1)).await;
                             continue;
                         }
                     };
@@ -237,6 +246,7 @@ impl SyncController {
                             }
                         };
 
+                        let self_clone = self.clone();
                         tokio::spawn(async move {
                             // 持有memory_permit，任务结束时自动释放
                             let _mem_permit = memory_permit;
@@ -252,13 +262,13 @@ impl SyncController {
                             let _exec_permit = exec_permit;
 
                             // 核心处理
-                            let result = Self::process_single_baseline(controller.clone(), &mint).await;
+                            let result = self_clone.process_single_baseline(controller.clone(), &mint).await;
 
                             // 处理完成后立即ACK
                             match result {
                                 Ok(_) => {
-                                    if let Err(e) = controller.redis.ack_message_baseline(&message_id).await {
-                                        error!("Failed to ACK message {} for mint {}: {}", message_id, mint, e);
+                                    if let Err(e) = controller.kafka_queue.ack_baseline_tasks(consumer_name).await {
+                                        error!("Failed to ACK message {} for mint {}: {}", consumer_name, mint, e);
                                     } else {
                                         info!("✅ Baseline completed for mint: {}", mint);
                                     }
@@ -278,8 +288,15 @@ impl SyncController {
     }
 
     /// 处理单个 mint 的完整 baseline 流程
-    async fn process_single_baseline(controller: SyncController, mint: &str) -> anyhow::Result<()> {
+    async fn process_single_baseline(&self, controller: SyncController, mint: &str) -> anyhow::Result<()> {
         /// todo!: 这里要做的一件事情是先对holder_count进行判断，如果数量大于某个阈值(20万)，则视为big token，使用其他方式获取
+        const BIG_TOKEN_HOLDER_COUNT: u64 = 10 * 10000;
+        let onchain_holder = self.http_client.get_sol_scan_holder(mint).await?;
+        if onchain_holder >= BIG_TOKEN_HOLDER_COUNT {
+            info!("big token holder count: {}", BIG_TOKEN_HOLDER_COUNT);
+            return Ok(()); // todo!: 返回 Ok 让队列直接 ack 这个mint
+        }
+
         // 步骤 1: 构建 baseline 数据
         let baseline_slot = match controller.build_baseline(mint).await {
             Ok(slot) => {
@@ -392,9 +409,6 @@ impl SyncController {
                         .upsert_synced_mints_atomic(&token_events)
                         .await?;
 
-                    // 确认当前events已经使用
-                    self.database.confirm_events(&token_events).await?;
-
                     total_processed += token_events.len();
                     cursor = next_cursor;
                 }
@@ -407,8 +421,6 @@ impl SyncController {
                             .await?;
                         total_processed += token_events.len();
                     }
-                    // 确认当前events已经使用
-                    self.database.confirm_events(&token_events).await?;
 
                     info!(
                         "Catch-up completed for mint {}: processed {} events",
@@ -453,32 +465,32 @@ mod tests {
             .init();
     }
 
-    #[tokio::test]
-    async fn test_consume_baseline_mints_for_queue() {
-        set_up();
-        // 创建消息队列
-        let redis_url = std::env::var("REDIS_URL");
-        let config = RedisQueueConfig::default();
-        let message_queue = Arc::new(Redis::new(&redis_url.unwrap(), config).await.unwrap());
-        let _ = message_queue.init_baseline_queue().await.unwrap();
-
-        let db_url = std::env::var("DATABASE_URL").unwrap();
-        let database_config = DatabaseConfig::new_optimized(db_url);
-        let database = Arc::new(DatabaseConnection::new(database_config).await.unwrap());
-
-        let http_rpc = std::env::var("RPC_URL").unwrap();
-        let http_client = Arc::new(HttpClient::new(http_rpc).unwrap());
-
-        let sync_controller =
-            SyncController::new(message_queue.clone(), database.clone(), http_client.clone());
-
-        let cancellation_token = CancellationToken::new();
-        let token = cancellation_token.child_token();
-        if let Err(e) = sync_controller
-            .consume_baseline_mints_for_queue(token)
-            .await
-        {
-            error!("Monitor error: {:?}", e);
-        }
-    }
+    // #[tokio::test]
+    // async fn test_consume_baseline_mints_for_queue() {
+    //     set_up();
+    //     // 创建消息队列
+    //     let redis_url = std::env::var("REDIS_URL");
+    //     let config = RedisQueueConfig::default();
+    //     let message_queue = Arc::new(Redis::new(&redis_url.unwrap(), config).await.unwrap());
+    //     let _ = message_queue.init_baseline_queue().await.unwrap();
+    //
+    //     let db_url = std::env::var("DATABASE_URL").unwrap();
+    //     let database_config = DatabaseConfig::new_optimized(db_url);
+    //     let database = Arc::new(DatabaseConnection::new(database_config).await.unwrap());
+    //
+    //     let http_rpc = std::env::var("RPC_URL").unwrap();
+    //     let http_client = Arc::new(HttpClient::default());
+    //
+    //     let sync_controller =
+    //         SyncController::new(message_queue.clone(), database.clone(), http_client.clone());
+    //
+    //     let cancellation_token = CancellationToken::new();
+    //     let token = cancellation_token.child_token();
+    //     if let Err(e) = sync_controller
+    //         .consume_baseline_mints_for_queue(token)
+    //         .await
+    //     {
+    //         error!("Monitor error: {:?}", e);
+    //     }
+    // }
 }

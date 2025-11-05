@@ -1,3 +1,4 @@
+use crate::EVENT_LOG_TARGET;
 use crate::database::postgresql::DatabaseConnection;
 use crate::utils::timer::TaskLogger;
 use anyhow::{Error, Result, anyhow};
@@ -102,7 +103,10 @@ impl EventsRepository for DatabaseConnection {
             .collect::<Vec<_>>();
         let tx_sigs = events
             .iter()
-            .map(|event| event.tx_sig.clone())
+            .map(|event| {
+                info!(target: EVENT_LOG_TARGET, "Upserted event sig:{:?}", event.tx_sig);
+                event.tx_sig.clone()
+            })
             .collect::<Vec<_>>();
         let mint_pubkeys = events
             .iter()

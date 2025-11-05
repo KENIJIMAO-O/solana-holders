@@ -1,14 +1,13 @@
-use crate::baseline::{GetAccountInfoData, GetProgramAccountsData};
+use crate::baseline::{GetAccountInfoData, GetProgramAccountsData, HttpClient};
 use crate::monitor::utils::constant::{TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID_2022};
 use anyhow::{Error, Result, anyhow};
+use futures::stream::Stream;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::str::FromStr;
-use std::time::Duration;
-use tracing::info;
-use futures::stream::Stream;
 use std::pin::Pin;
+use std::str::FromStr;
+use tracing::info;
 
 #[derive(Debug, Deserialize, Serialize)] // 使用 Debug trait 方便打印调试
 pub struct TokenHolder {
@@ -20,28 +19,7 @@ pub struct TokenHolder {
     pub decimals: u16,
 }
 
-#[derive(Clone, Debug)]
-pub struct HttpClient {
-    rpc_url: String,
-    http_client: reqwest::Client,
-}
-
 impl HttpClient {
-    pub fn new(rpc_url: String) -> Result<Self> {
-        let http_client = reqwest::Client::builder()
-            .pool_max_idle_per_host(20)
-            .pool_idle_timeout(Duration::from_secs(60))
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(1600))
-            .tcp_keepalive(Duration::from_secs(30))
-            .build()
-            .map_err(|e| anyhow::anyhow!("Failed to create batch HTTP client: {}", e))?;
-        Ok(Self {
-            rpc_url,
-            http_client,
-        })
-    }
-
     // baseline 入口
     pub async fn get_token_holders(&self, mint: &str) -> Result<Vec<TokenHolder>, Error> {
         // 1.判断当前代币类型
@@ -126,9 +104,8 @@ impl HttpClient {
         let slot = get_program_accounts_result.context.slot;
 
         let token_holders: Vec<TokenHolder> = get_program_accounts_result
-            .value
-            .accounts
-            .into_iter()
+            .accounts()
+            .iter()
             .filter(|value_info| {
                 // 过滤balance，仅保留大于0的token_account
                 let balance_str = &value_info
@@ -151,16 +128,17 @@ impl HttpClient {
             })
             .map(|value_info| TokenHolder {
                 slot,
-                mint: value_info.account.data.parsed.info.mint,
-                owner: value_info.account.data.parsed.info.owner,
-                pubkey: value_info.pubkey,
+                mint: value_info.account.data.parsed.info.mint.clone(),
+                owner: value_info.account.data.parsed.info.owner.clone(),
+                pubkey: value_info.pubkey.clone(),
                 balance: value_info
                     .account
                     .data
                     .parsed
                     .info
                     .token_amount
-                    .ui_amount_string,
+                    .ui_amount_string
+                    .clone(),
                 decimals: value_info.account.data.parsed.info.token_amount.decimals,
             })
             .collect();
@@ -169,7 +147,7 @@ impl HttpClient {
         // 有一种情况rust允许函数返回引用，那就是这个返回的值是从函数外部传进来的，同时还得声明其生命周期（第一次具象化感受到了生命周期的作用）
         Ok(token_holders)
     }
-    
+
     pub async fn get_program_accounts_2022(&self, mint: &str) -> Result<Vec<TokenHolder>, Error> {
         let request_body = serde_json::json!({
                 "jsonrpc": "2.0",
@@ -181,9 +159,6 @@ impl HttpClient {
                     "encoding": "jsonParsed",
                     "withContext": true,
                     "filters": [
-                    // {
-                    //     "dataSize": 182
-                    // },
                     {
                         "memcmp": {
                         "offset": 0,
@@ -215,9 +190,8 @@ impl HttpClient {
         let slot = get_program_accounts_result.context.slot;
 
         let token_holders: Vec<TokenHolder> = get_program_accounts_result
-            .value
-            .accounts
-            .into_iter()
+            .accounts()
+            .iter()
             .filter(|value_info| {
                 // 过滤balance，仅保留大于0的token_account
                 let balance_str = &value_info
@@ -240,16 +214,17 @@ impl HttpClient {
             })
             .map(|value_info| TokenHolder {
                 slot,
-                mint: value_info.account.data.parsed.info.mint,
-                owner: value_info.account.data.parsed.info.owner,
-                pubkey: value_info.pubkey,
+                mint: value_info.account.data.parsed.info.mint.clone(),
+                owner: value_info.account.data.parsed.info.owner.clone(),
+                pubkey: value_info.pubkey.clone(),
                 balance: value_info
                     .account
                     .data
                     .parsed
                     .info
                     .token_amount
-                    .ui_amount_string,
+                    .ui_amount_string
+                    .clone(),
                 decimals: value_info.account.data.parsed.info.token_amount.decimals,
             })
             .collect();
@@ -352,6 +327,7 @@ impl HttpClient {
                 let result = match json_response.get("result") {
                     Some(r) => r.clone(),
                     None => {
+                        println!("result:{:?}", json_response);
                         yield Err(anyhow!("响应中没有result字段"));
                         return;
                     }
@@ -367,10 +343,15 @@ impl HttpClient {
                     };
 
                 let slot = get_program_accounts_result.context.slot;
-                pagination_key = get_program_accounts_result.value.pagination_key.clone();
+
+                // 提取 pagination_key（只有 V2 格式才有）
+                pagination_key = match &get_program_accounts_result.value {
+                    crate::baseline::ValueInfo::V2(v2) => v2.pagination_key.clone(),
+                    crate::baseline::ValueInfo::Legacy(_) => None,
+                };
 
                 // 逐个yield TokenHolder，不累积在内存中
-                for value_info in get_program_accounts_result.value.accounts {
+                for value_info in get_program_accounts_result.accounts() {
                     let balance_str = &value_info.account.data.parsed.info.token_amount.ui_amount_string;
 
                     let should_include = match Decimal::from_str(balance_str) {
@@ -384,10 +365,10 @@ impl HttpClient {
                     if should_include {
                         let holder = TokenHolder {
                             slot,
-                            mint: value_info.account.data.parsed.info.mint,
-                            owner: value_info.account.data.parsed.info.owner,
-                            pubkey: value_info.pubkey,
-                            balance: value_info.account.data.parsed.info.token_amount.ui_amount_string,
+                            mint: value_info.account.data.parsed.info.mint.clone(),
+                            owner: value_info.account.data.parsed.info.owner.clone(),
+                            pubkey: value_info.pubkey.clone(),
+                            balance: value_info.account.data.parsed.info.token_amount.ui_amount_string.clone(),
                             decimals: value_info.account.data.parsed.info.token_amount.decimals,
                         };
 
@@ -444,15 +425,16 @@ mod tests {
     async fn test_get_token_holders() {
         dotenv::dotenv().ok();
         let rpc_url = std::env::var("RPC_URL").unwrap();
-        let http_client = HttpClient::new(rpc_url).unwrap();
+        let http_client = HttpClient::default();
 
-        let mint = "2oQNkePakuPbHzrVVkQ875WHeewLHCd2cAwfwiLQbonk";
+        let mint = "4Cnk9EPnW5ixfLZatCPJjDB1PUtcRpVVgTQukm9epump";
         let res = http_client.get_token_holders(mint).await;
 
         let path = "getProgramAccounts.json";
         let mut output = File::create(path).unwrap();
 
         if let Ok(json_value) = res {
+            println!("token:{:?} has holder:{:?}", mint, json_value.len());
             println!("start to write res into file");
             if let Err(e) = serde_json::to_writer_pretty(&mut output, &json_value) {
                 println!("🔥 写入JSON文件失败: {}", e);
@@ -473,7 +455,7 @@ mod tests {
 
         dotenv::dotenv().ok();
         let rpc_url = std::env::var("SOLANA_NODE_RPC_URL").unwrap();
-        let http_client = HttpClient::new(rpc_url).unwrap();
+        let http_client = HttpClient::default();
 
         let mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
@@ -509,7 +491,7 @@ mod tests {
     async fn test_get_program_accounts_2022() {
         dotenv::dotenv().ok();
         let rpc_url = std::env::var("RPC_URL").unwrap();
-        let http_client = HttpClient::new(rpc_url).unwrap();
+        let http_client = HttpClient::default();
 
         let mint = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn";
         let res = http_client.get_program_accounts_2022(mint).await;
@@ -531,9 +513,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_program_accounts_v2() {
-        use std::time::Instant;
-        use std::io::BufWriter;
         use futures::stream::StreamExt;
+        use std::io::BufWriter;
+        use std::time::Instant;
 
         let start_time = Instant::now();
         println!("Start time: {:?}", start_time);
@@ -541,10 +523,11 @@ mod tests {
         dotenv::dotenv().ok();
         let rpc_url = std::env::var("SOLANA_NODE_RPC_URL").unwrap();
         println!("HTTP URL: {}", rpc_url);
-        let http_client = HttpClient::new(rpc_url).unwrap();
+        let sol_scan_token = std::env::var("SOLSCAN_API_KEY").unwrap();
+        let http_client = HttpClient::new(rpc_url, sol_scan_token).unwrap();
 
         // DFL1zNkaGPWm1BqAVqRjCZvHmwTFrEaJtbzJWgseoNJh EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
-        let mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"; // usdc
+        let mint = "4Cnk9EPnW5ixfLZatCPJjDB1PUtcRpVVgTQukm9epump"; // usdc
 
         let path = "getProgramAccountsV2.json";
         let file = match File::create(path) {

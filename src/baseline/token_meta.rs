@@ -1,13 +1,12 @@
+use crate::baseline::HttpClient;
 use anyhow::anyhow;
 use reqwest::Client;
 use serde_json::Value;
-use crate::baseline::HttpClient;
 
 impl HttpClient {
-
     pub async fn get_sol_scan_holder(&self, mint: &str) -> anyhow::Result<u64> {
         let base_url = std::env::var("BASE_URL").unwrap();
-        let url = format!("{}{}",base_url,mint);
+        let url = format!("{}{}", base_url, mint);
 
         let response_text = self.get_token_meta(&url).await?;
 
@@ -33,7 +32,9 @@ impl HttpClient {
     }
 
     async fn get_token_meta(&self, url: &str) -> Result<String, reqwest::Error> {
-        let response = self.http_client.get(url)
+        let response = self
+            .http_client
+            .get(url)
             .header("content-type", "application/json")
             .header("token", &self.sol_scan_token) // "token" 是自定义的 header 名称
             .send()
@@ -46,7 +47,6 @@ impl HttpClient {
         let response_text = response.text().await?;
         Ok(response_text)
     }
-
 }
 
 #[cfg(test)]
@@ -72,12 +72,8 @@ mod tests {
         let base_url = "https://pro-api.solscan.io/v2.0/token/meta?address=";
         let mint = "DuWbi8VHLJBbUQ7f6vJmkneFESD5tANDPkKXogDQpump";
 
-        let url = format!("{}{}",base_url,mint);
+        let url = format!("{}{}", base_url, mint);
 
         let res = http_client.get_token_meta(&url).await;
     }
-
-
 }
-
-

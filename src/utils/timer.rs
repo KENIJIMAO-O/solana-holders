@@ -1,12 +1,12 @@
 use std::time::Instant;
-use tracing::{debug, info};
+use tracing::{Level, debug, error, info, warn};
 
 /// TaskLogger - 任务级别的日志收集器
 /// 用于收集单个异步任务的所有日志信息，避免多线程交错问题
 pub struct TaskLogger {
     task_id: String,
     task_type: String,
-    logs: Vec<(u64, String)>, // (elapsed_ms, message)
+    logs: Vec<(u64, Level, String)>, // (elapsed_ms, level, message)
     start_time: Instant,
     flushed: bool, // 防止重复输出
 }
@@ -37,16 +37,66 @@ impl TaskLogger {
         }
     }
 
-    /// 添加日志条目
+    /// 添加日志条目（默认 INFO 级别，保持向后兼容）
     pub fn log(&mut self, message: &str) {
-        let elapsed_ms = self.start_time.elapsed().as_millis() as u64;
-        self.logs.push((elapsed_ms, message.to_string()));
+        self.info(message);
     }
 
-    /// 添加格式化日志条目
+    /// 添加格式化日志条目（默认 INFO 级别，保持向后兼容）
     pub fn log_fmt(&mut self, message: String) {
+        self.info_fmt(message);
+    }
+
+    /// 添加 DEBUG 级别日志
+    pub fn debug(&mut self, message: &str) {
         let elapsed_ms = self.start_time.elapsed().as_millis() as u64;
-        self.logs.push((elapsed_ms, message));
+        self.logs
+            .push((elapsed_ms, Level::DEBUG, message.to_string()));
+    }
+
+    /// 添加格式化的 DEBUG 级别日志
+    pub fn debug_fmt(&mut self, message: String) {
+        let elapsed_ms = self.start_time.elapsed().as_millis() as u64;
+        self.logs.push((elapsed_ms, Level::DEBUG, message));
+    }
+
+    /// 添加 INFO 级别日志
+    pub fn info(&mut self, message: &str) {
+        let elapsed_ms = self.start_time.elapsed().as_millis() as u64;
+        self.logs
+            .push((elapsed_ms, Level::INFO, message.to_string()));
+    }
+
+    /// 添加格式化的 INFO 级别日志
+    pub fn info_fmt(&mut self, message: String) {
+        let elapsed_ms = self.start_time.elapsed().as_millis() as u64;
+        self.logs.push((elapsed_ms, Level::INFO, message));
+    }
+
+    /// 添加 WARN 级别日志
+    pub fn warn(&mut self, message: &str) {
+        let elapsed_ms = self.start_time.elapsed().as_millis() as u64;
+        self.logs
+            .push((elapsed_ms, Level::WARN, message.to_string()));
+    }
+
+    /// 添加格式化的 WARN 级别日志
+    pub fn warn_fmt(&mut self, message: String) {
+        let elapsed_ms = self.start_time.elapsed().as_millis() as u64;
+        self.logs.push((elapsed_ms, Level::WARN, message));
+    }
+
+    /// 添加 ERROR 级别日志
+    pub fn error(&mut self, message: &str) {
+        let elapsed_ms = self.start_time.elapsed().as_millis() as u64;
+        self.logs
+            .push((elapsed_ms, Level::ERROR, message.to_string()));
+    }
+
+    /// 添加格式化的 ERROR 级别日志
+    pub fn error_fmt(&mut self, message: String) {
+        let elapsed_ms = self.start_time.elapsed().as_millis() as u64;
+        self.logs.push((elapsed_ms, Level::ERROR, message));
     }
 
     /// 获取任务总耗时
@@ -63,14 +113,20 @@ impl TaskLogger {
         let total_ms = self.total_duration_ms();
         let icon = self.get_task_icon();
 
-        info!(
+        debug!(
             "=== {} {} Processing: {} ===",
             icon, self.task_type, self.task_id
         );
 
-        // 输出所有收集的日志
-        for (elapsed_ms, message) in &self.logs {
-            info!("  [{}ms] {}", elapsed_ms, message);
+        // 输出所有收集的日志，根据等级调用相应的宏
+        for (elapsed_ms, level, message) in &self.logs {
+            match *level {
+                Level::ERROR => error!("  [{}ms] {}", elapsed_ms, message),
+                Level::WARN => warn!("  [{}ms] {}", elapsed_ms, message),
+                Level::INFO => info!("  [{}ms] {}", elapsed_ms, message),
+                Level::DEBUG => debug!("  [{}ms] {}", elapsed_ms, message),
+                Level::TRACE => debug!("  [{}ms] {}", elapsed_ms, message),
+            }
         }
 
         // 输出任务完成标记
@@ -99,8 +155,14 @@ impl Drop for TaskLogger {
                 "=== {} {} Processing: {} ===",
                 icon, self.task_type, self.task_id
             );
-            for (elapsed_ms, message) in &self.logs {
-                info!("  [{}ms] {}", elapsed_ms, message);
+            for (elapsed_ms, level, message) in &self.logs {
+                match *level {
+                    Level::ERROR => error!("  [{}ms] {}", elapsed_ms, message),
+                    Level::WARN => warn!("  [{}ms] {}", elapsed_ms, message),
+                    Level::INFO => info!("  [{}ms] {}", elapsed_ms, message),
+                    Level::DEBUG => debug!("  [{}ms] {}", elapsed_ms, message),
+                    Level::TRACE => debug!("  [{}ms] {}", elapsed_ms, message),
+                }
             }
             debug!("=== Task Completed: {}ms total ===", total_ms);
             self.flushed = true;

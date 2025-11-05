@@ -1,4 +1,3 @@
-# yaml 配置
 services:
   redis:
     image: redis:7-alpine
@@ -19,6 +18,47 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
+    restart: unless-stopped
+
+  kafka:
+    image: apache/kafka:4.1.0
+    container_name: kafka
+    ports:
+      - "9092:9092"        # 外部客户端连接端口
+      - "29092:29092"      # 内部 Docker 网络连接端口（可选）
+    environment:
+      KAFKA_ENABLE_KRAFT: yes # kraft字段
+      KAFKA_NODE_ID: 1     # kafka节点ID
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:29093"
+
+      # Listener 配置（更稳定）
+      # kafka 监听哪些端口 PLAINTEXT - 客户端发送消息的端口 CONTROLLER - Kafka 节点之间选主通信使用
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:29093"
+      # 告诉外部客户端要连接的地址
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://localhost:9092"
+
+      # Listener 安全协议映射
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+
+      # Controller
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # 副本因子配置（单节点必须设置为1）
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
+      # Kafka 数据目录
+      KAFKA_LOG_DIRS: "/tmp/kraft-combined-logs"
+
+      # 自动创建 topic
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+
+      # 集群 ID（建议固定）
+      CLUSTER_ID: "xYzabcDEF1234567890abc"
+    volumes:
+      - ./kafka-data:/tmp/kraft-combined-logs
     restart: unless-stopped
 
 volumes:
