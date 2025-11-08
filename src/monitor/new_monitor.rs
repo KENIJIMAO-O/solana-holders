@@ -253,7 +253,7 @@ impl NewMonitor {
                     convert_to_encoded_tx(tx)
                         .ok()
                         .and_then(|encoded_tx| {
-                            Self::process_transaction(encoded_tx, sig, block_slot as i64).ok()
+                            Self::process_transaction(encoded_tx, sig, block_slot).ok()
                         })
                         .unwrap_or_default() // Option<Vec<TokenEvent>> -> Vec<TokenEvent>
                 })
@@ -294,7 +294,7 @@ impl NewMonitor {
     fn process_transaction(
         transaction: EncodedTransactionWithStatusMeta,
         sig: String,
-        block_slot: i64,
+        block_slot: u64,
     ) -> Result<Vec<TokenEvent>, Error> {
         let meta = transaction
             .meta

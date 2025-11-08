@@ -1,13 +1,13 @@
 use crate::baseline::HttpClient;
 use crate::database::postgresql::{DatabaseConfig, DatabaseConnection};
-use crate::message_queue::token_event_message_queue::{Redis, RedisQueueConfig};
 use crate::monitor::client::GrpcClient;
-use crate::monitor::monitor::{Monitor, MonitorConfig, ReConnectConfig};
+use crate::monitor::monitor::{MonitorConfig, ReConnectConfig};
 use crate::monitor::new_monitor::NewMonitor;
 use crate::sync_controller::sync_controller::SyncController;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
+use crate::clickhouse::clickhouse::ClickHouse;
 use crate::kafka::{KafkaMessageQueue, KafkaQueueConfig};
 
 pub mod baseline;
@@ -19,6 +19,7 @@ pub mod reconciliation;
 pub mod repositories;
 pub mod sync_controller;
 pub mod utils;
+pub mod clickhouse;
 pub struct Server;
 
 pub const EVENT_LOG_TARGET: &str = "my_app::event_log";
@@ -84,16 +85,21 @@ impl Server {
             })
         };
 
-        // todo: 现在缺的是monitor和消息队列以及数据库连接起来的过程
-        // 2.启动 sync controller
+        // 2.postgres, clickhouse
         let db_url = std::env::var("DATABASE_URL").unwrap();
         let database_config = DatabaseConfig::new_optimized(db_url);
         let database = Arc::new(DatabaseConnection::new(database_config).await.unwrap());
 
+        let clickhouse_url = std::env::var("CLICKHOUSE_URL").unwrap();
+        let database_name = std::env::var("CLICKHOUSE_DATABASE_NAME").unwrap();
+        let password = std::env::var("CLICKHOUSE_PASSWORD").unwrap();
+        let clickhouse_client = Arc::new(ClickHouse::new(&clickhouse_url, &database_name, &password));
+
         let http_client = Arc::new(HttpClient::default());
 
+        // 3.启动 sync controller
         let sync_controller =
-            SyncController::new(message_queue.clone(), database.clone(), http_client.clone());
+            SyncController::new(message_queue.clone(), database.clone(), clickhouse_client.clone(), http_client.clone());
         let sync_controller_events = {
             let mut sync_controller = sync_controller.clone();
             let token = cancellation_token.child_token();
@@ -102,7 +108,6 @@ impl Server {
                 if let Err(e) = sync_controller.consume_events_from_queue(token).await {
                     error!("Monitor error: {:?}", e);
                 }
-
                 debug!("Monitor completed");
             })
         };
@@ -117,7 +122,6 @@ impl Server {
                 {
                     error!("Monitor error: {:?}", e);
                 }
-
                 debug!("Monitor completed");
             })
         };

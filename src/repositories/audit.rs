@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::collections::HashMap;
+use crate::clickhouse::helper::ClickhouseDecimal;
 
 /// todo!: 当前crate，仅用于数据验证，到生产环境就删除，审计记录结构
 #[derive(Debug, Clone)]
@@ -21,7 +22,7 @@ pub async fn insert_audit_records(
     mint_pubkeys: &[String],
     holder_counts: &[i64],
     max_slots: &[i64],
-    total_balances: &HashMap<String, Decimal>,
+    total_balances: &HashMap<String, ClickhouseDecimal>,
     source: &str,
 ) -> Result<(), Error> {
     let audit_mints = std::env::var("AUDIT_MINTS").unwrap_or_default();
@@ -33,7 +34,10 @@ pub async fn insert_audit_records(
 
     for (i, mint) in mint_pubkeys.iter().enumerate() {
         if audit_list.contains(&mint.as_str()) {
-            let total_balance = total_balances.get(mint).copied().unwrap_or(Decimal::ZERO);
+            let total_balance = total_balances
+                .get(mint)
+                .map(|cd| cd.to_decimal())
+                .unwrap_or(Decimal::ZERO);
             sqlx::query!(
                 r#"
                 INSERT INTO mint_stats_audit_log

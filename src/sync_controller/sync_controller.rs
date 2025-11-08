@@ -1,7 +1,6 @@
 use crate::database::postgresql::DatabaseConnection;
 use crate::message_queue::token_event_message_queue::Redis;
 use crate::repositories::AtomicityData;
-use crate::repositories::events::{Event, EventsRepository};
 use crate::repositories::tracked_mints::TrackedMintsRepository;
 use crate::utils::timer::TaskLogger;
 use crate::baseline::HttpClient;
@@ -12,12 +11,14 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
+use crate::clickhouse::clickhouse::{ClickHouse, Event};
 use crate::kafka::KafkaMessageQueue;
 
 #[derive(Clone)]
 pub struct SyncController {
     pub kafka_queue: Arc<KafkaMessageQueue>,
     pub database: Arc<DatabaseConnection>,
+    pub clickhouse: Arc<ClickHouse>,
     pub http_client: Arc<HttpClient>,
 }
 
@@ -25,11 +26,13 @@ impl SyncController {
     pub fn new(
         kafka_queue: Arc<KafkaMessageQueue>,
         database: Arc<DatabaseConnection>,
+        clickhouse: Arc<ClickHouse>,
         http_client: Arc<HttpClient>,
     ) -> Self {
         Self {
             kafka_queue,
             database,
+            clickhouse,
             http_client,
         }
     }
@@ -82,6 +85,7 @@ impl SyncController {
                             // 1. 尝试将 delta 字符串解析为 Decimal
                             match raw_event.delta.parse::<Decimal>() {
                                 Ok(delta) => {
+                                    let confirmed_u8 = if raw_event.confirmed {1u8} else {0u8};
                                     // 2. 如果解析成功，构建 Event 对象
                                     let event = Event::new(
                                         raw_event.slot,
@@ -90,7 +94,7 @@ impl SyncController {
                                         raw_event.account_address.to_string(),
                                         raw_event.owner_address.map_or("".to_string(), |o| o.to_string()),
                                         delta,
-                                        raw_event.confirmed,
+                                        confirmed_u8,
                                     );
                                     // 3. 将有效的元组包裹在 Some 中返回，以保留此数据
                                     Some((message_id.clone(), event))
@@ -123,9 +127,10 @@ impl SyncController {
                     let mint_len = mints.len();
 
                     let untracked_mints = self.database.is_tracked_batch(&mints).await?;
-                    error!("untracked_mints_len:{}", untracked_mints.len());
+                    logger.log(&format!("untracked_mints_len:{}", untracked_mints.len()));
 
                     self.kafka_queue.batch_enqueue_baseline_task(&untracked_mints).await?;
+                    logger.log("complete batch enqueue baseline");
 
                     // --- 核心职责：将新的数据更新到数据库中 ---
                     // todo!: 这里我想说的就是，对于任意一个数据，一定会进events表，如果这个代币已经构建了baseline，那么可以直接利用从token queue获取的数据更新
@@ -134,7 +139,7 @@ impl SyncController {
                     if !token_events.is_empty() {
 
                         // 对于events表，无论当前代币处于 Not_started baseline_building catching_up synced 任意一个阶段，都需要更新
-                        match self.database.upsert_events_batch(&token_events, &mut logger).await {
+                        match self.clickhouse.upsert_events_batch(&token_events, &mut logger).await {
                             Ok(()) => {
                                 // ack token_queue message
                                  if let Err(e) = self.kafka_queue.ack_token_events(consumer_name).await {
@@ -163,7 +168,9 @@ impl SyncController {
                             .collect();
 
                         if synced_token_events.is_empty() { continue }
-                        if let Err(e) = self.database.upsert_synced_mints_atomic(&synced_token_events).await {
+                        
+                        // 这俩可能需要绑定在一块
+                        if let Err(e) = self.database.upsert_synced_mints_atomic(&synced_token_events, &self.clickhouse).await {
                             error!("upsert token_account, holders, mint_stats error: {}", e);
                         }
 
@@ -381,7 +388,7 @@ impl SyncController {
         // 在开始处理之前，将 baseline_slot 之前的所有未确认事件标记为 confirmed
         // 因为 baseline 已经代表了那个时刻的完整状态，这些过时的事件不需要再处理
         let skipped_count = self
-            .database
+            .clickhouse
             .confirm_events_before_baseline(mint, baseline_slot)
             .await?;
         if skipped_count > 0 {
@@ -393,7 +400,7 @@ impl SyncController {
 
         loop {
             match self
-                .database
+                .clickhouse
                 .get_next_events_batch(cursor, mint, BATCH_SIZE)
                 .await
             {
@@ -406,7 +413,7 @@ impl SyncController {
 
                     info!("In next_cursor to sync mint atomic");
                     self.database
-                        .upsert_synced_mints_atomic(&token_events)
+                        .upsert_synced_mints_atomic(&token_events, &self.clickhouse)
                         .await?;
 
                     total_processed += token_events.len();
@@ -417,7 +424,7 @@ impl SyncController {
                     info!("In none to sync mint atomic");
                     if !token_events.is_empty() {
                         self.database
-                            .upsert_synced_mints_atomic(&token_events)
+                            .upsert_synced_mints_atomic(&token_events, &self.clickhouse)
                             .await?;
                         total_processed += token_events.len();
                     }

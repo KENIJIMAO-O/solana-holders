@@ -40,7 +40,7 @@ pub enum InstructionType {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TokenEvent {
     // 唯一标识一个指令
-    pub slot: i64,
+    pub slot: u64,
     pub tx_signature: String,
     pub instruction_index: u32,
 
@@ -324,7 +324,7 @@ impl Monitor {
                     convert_to_encoded_tx(tx)
                         .ok()
                         .and_then(|encoded_tx| {
-                            Self::process_transaction(encoded_tx, sig, block_slot as i64).ok()
+                            Self::process_transaction(encoded_tx, sig, block_slot).ok()
                         })
                         .unwrap_or_default() // Option<Vec<TokenEvent>> -> Vec<TokenEvent>
                 })
@@ -365,7 +365,7 @@ impl Monitor {
     fn process_transaction(
         transaction: EncodedTransactionWithStatusMeta,
         sig: String,
-        block_slot: i64,
+        block_slot: u64,
     ) -> Result<Vec<TokenEvent>, Error> {
         let meta = transaction
             .meta
@@ -469,7 +469,7 @@ impl Monitor {
                                 owner_address: owner,
                                 delta,
                                 instruction_type: InstructionType::Other, // 简化，不关注具体类型
-                                confirmed: false,
+                                confirmed: false, // 0 as false
                             };
                             events.push(token_event);
                             instruction_index += 1;

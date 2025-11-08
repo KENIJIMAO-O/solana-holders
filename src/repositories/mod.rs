@@ -1,15 +1,15 @@
 use crate::baseline::getProgramAccounts::TokenHolder;
 use crate::database::postgresql::DatabaseConnection;
-use crate::repositories::events::Event;
 use crate::repositories::token_accounts::aggregate_token_account_events;
 use anyhow::Error;
 use rust_decimal::Decimal;
 use std::collections::{HashMap, HashSet};
 use tracing::info;
 use yellowstone_grpc_proto::tonic::async_trait;
+use crate::clickhouse::clickhouse::{ClickHouse, Event};
+use crate::clickhouse::helper::ClickhouseDecimal;
 
 pub mod audit;
-pub mod events;
 pub mod holders;
 pub mod mint_stats;
 pub mod reconciliation_schedule;
@@ -18,19 +18,19 @@ pub mod tracked_mints;
 
 /// token_accounts 聚合数据结构
 #[derive(Debug, Clone)]
-struct TokenAccountAggregateData {
-    acct_pubkey: String,
-    mint_pubkey: String,
-    owner_pubkey: String,
-    delta: Decimal,         // 聚合后的 delta
-    last_updated_slot: i64, // 最大 slot
+pub(crate) struct TokenAccountAggregateData {
+    pub acct_pubkey: String,
+    pub mint_pubkey: String,
+    pub owner_pubkey: String,
+    pub delta: ClickhouseDecimal,  // 聚合后的 delta
+    pub last_updated_slot: i64,    // 最大 slot
 }
 
 /// 该特征的作用是保证，在对token_accounts, holders, mint_stats这三张表更新时，必须保证更新的原子性
 #[async_trait]
 pub trait AtomicityData {
     /// 原子性更新三张表（用于实时监听的 synced mint）
-    async fn upsert_synced_mints_atomic(&self, synced_events: &[Event]) -> anyhow::Result<()>;
+    async fn upsert_synced_mints_atomic(&self, synced_events: &[Event], clickhouse: &ClickHouse) -> anyhow::Result<()>;
 
     /// 原子性建立 baseline（用于初次构建 baseline）
     /// 返回 baseline_slot
@@ -45,7 +45,11 @@ pub trait AtomicityData {
 /// 对于upsert_synced_mints_atomic函数，在上游已经进行了分块处理
 #[async_trait]
 impl AtomicityData for DatabaseConnection {
-    async fn upsert_synced_mints_atomic(&self, synced_events: &[Event]) -> Result<(), Error> {
+    async fn upsert_synced_mints_atomic(
+        &self,
+        synced_events: &[Event],
+        clickhouse: &ClickHouse
+    ) -> Result<(), Error> {
         if synced_events.is_empty() {
             return Ok(());
         }
@@ -175,8 +179,8 @@ impl AtomicityData for DatabaseConnection {
         for event in synced_events {
             mint_max_slots
                 .entry(event.mint_pubkey.clone())
-                .and_modify(|slot| *slot = (*slot).max(event.slot))
-                .or_insert(event.slot);
+                .and_modify(|slot| *slot = (*slot).max(event.slot as i64))
+                .or_insert(event.slot as i64);
         }
 
         // 4. 重新统计 holder_count
@@ -237,12 +241,12 @@ impl AtomicityData for DatabaseConnection {
         .await?;
 
         // 6. 审计：记录 mint_stats 变化历史（如果在审计列表中）
-        let mut total_balances: HashMap<String, Decimal> = HashMap::new();
+        let mut total_balances: HashMap<String, ClickhouseDecimal> = HashMap::new();
         for data in &aggregate_datas {
-            total_balances
+            let entry = total_balances
                 .entry(data.mint_pubkey.clone())
-                .and_modify(|b| *b += data.balance)
-                .or_insert(data.balance);
+                .or_insert(ClickhouseDecimal::from_int(0));
+            *entry = *entry + data.balance;
         }
 
         audit::insert_audit_records(
@@ -255,39 +259,10 @@ impl AtomicityData for DatabaseConnection {
         )
         .await?;
 
-        // 7. 确认所有处理完成的 events（将 confirmed 设置为 true）
-        info!("start confirming events");
-        let event_tx_sigs: Vec<String> = synced_events
-            .iter()
-            .map(|event| event.tx_sig.clone())
-            .collect();
-        let event_account_pubkeys: Vec<String> = synced_events
-            .iter()
-            .map(|event| event.account_pubkey.clone())
-            .collect();
-
-        let rows_affected = sqlx::query!(
-            r#"
-            UPDATE events
-            SET confirmed = true
-            FROM UNNEST($1::varchar[], $2::varchar[]) AS t(tx_sig, account_pubkey)
-            WHERE
-                events.tx_sig = t.tx_sig
-                AND events.account_pubkey = t.account_pubkey
-                AND events.confirmed = false
-            "#,
-            &event_tx_sigs,
-            &event_account_pubkeys,
-        )
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-
-        if rows_affected > 0 {
-            info!("Confirmed {} events in atomic transaction", rows_affected);
-        }
-
+        // todo!: 因为使用的两个数据库就是不一样，所以导致现有的框架无法保证两个数据库的数据更新呈现原子性
         tx.commit().await?;
+        clickhouse.confirm_events(synced_events).await?;
+
         Ok(())
     }
 

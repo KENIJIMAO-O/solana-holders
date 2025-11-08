@@ -8,9 +8,16 @@ CLAUDE.md
 log.log
 requirements.txt
 verify_slot_consistency.py
+find_data_in_redis.py
 package-lock.json
 package.json
 node_modules
 getProgramAccountsV2.json
 usdc.log
+usdt.log
 usdt.json
+kafka-cli.sh
+kafka-data/
+logs/
+clickhouse-data
+clickhouse-logs

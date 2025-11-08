@@ -1,6 +1,5 @@
 use crate::baseline::getProgramAccounts::TokenHolder;
 use crate::database::postgresql::DatabaseConnection;
-use crate::repositories::events::Event;
 use crate::utils::timer::TaskLogger;
 use anyhow::Error;
 use rust_decimal::Decimal;
@@ -8,13 +7,15 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use tracing::warn; // 或者你使用的其他日志库
 use yellowstone_grpc_proto::tonic::async_trait;
+use crate::clickhouse::clickhouse::Event;
+use crate::clickhouse::helper::ClickhouseDecimal;
 
 // 这是我们准备写入 holders 表的聚合后数据的结构体
 #[derive(Debug)]
 pub struct HolderUpsertData {
     pub mint_pubkey: String,
     pub owner_pubkey: String,
-    pub balance: Decimal,
+    pub balance: ClickhouseDecimal,
     pub last_updated_slot: i64,
 }
 
@@ -24,10 +25,10 @@ pub fn aggregate_token_holders(token_accounts: &[TokenHolder]) -> Vec<HolderUpse
     // 使用 HashMap 来进行聚合
     // Key: (mint_pubkey, owner_pubkey)
     // Value: (aggregated_balance, max_slot)
-    let mut aggregation_map: HashMap<&str, Decimal> = HashMap::new();
+    let mut aggregation_map: HashMap<&str, ClickhouseDecimal> = HashMap::new();
 
     for account in token_accounts {
-        let balance = match Decimal::from_str(&account.balance) {
+        let balance = match ClickhouseDecimal::from_str(&account.balance) {
             Ok(b) => b,
             Err(e) => {
                 warn!(
@@ -39,12 +40,12 @@ pub fn aggregate_token_holders(token_accounts: &[TokenHolder]) -> Vec<HolderUpse
         };
 
         // 使用 HashMap 的 entry API，这是最优雅和高效的方式
-        let mut entry = aggregation_map
+        let entry = aggregation_map
             .entry(&account.owner)
-            .or_insert(Decimal::ZERO); // 如果 key 不存在，则插入一个默认值
+            .or_insert(ClickhouseDecimal::from_int(0)); // 如果 key 不存在，则插入一个默认值
 
         // 累加余额
-        entry += balance;
+        *entry = *entry + balance;
     }
 
     // 将聚合后的 HashMap 转换为 Vec<HolderUpsertData>
@@ -62,16 +63,17 @@ pub fn aggregate_token_holders(token_accounts: &[TokenHolder]) -> Vec<HolderUpse
 }
 
 pub fn aggregate_events(events: &[Event]) -> Vec<HolderUpsertData> {
-    let mut aggregation_map: HashMap<(String, String), (Decimal, i64)> = HashMap::new();
+    let mut aggregation_map: HashMap<(String, String), (ClickhouseDecimal, u64)> = HashMap::new();
 
     for event in events {
         let delta = event.delta;
 
         let mut entry = aggregation_map
             .entry((event.mint_pubkey.clone(), event.owner_pubkey.clone()))
-            .or_insert((Decimal::ZERO, 0));
-
-        entry.0 += delta;
+            .or_insert((ClickhouseDecimal::from_decimal(Decimal::from(0)), 0));
+        
+        // todo!: 注意
+        entry.0 = entry.0 + delta;
         entry.1 = entry.1.max(event.slot);
     }
 
@@ -81,7 +83,7 @@ pub fn aggregate_events(events: &[Event]) -> Vec<HolderUpsertData> {
             mint_pubkey: mint,
             owner_pubkey: owner,
             balance: delta,
-            last_updated_slot: lastest_slot,
+            last_updated_slot: lastest_slot as i64,
         })
         .collect();
 
@@ -96,10 +98,6 @@ pub trait HoldersRepository {
         token_accounts: &[TokenHolder],
         logger: &mut TaskLogger,
     ) -> Result<usize, Error>;
-
-    /// 监听时更新用户余额
-    /// 返回：每个 mint 的 balance > 0 的 holder 数量 HashMap<mint_pubkey, holder_count>
-    async fn upsert_holder_batch(&self, events: &[Event]) -> Result<Vec<(String, i64)>, Error>;
 }
 
 #[async_trait]
@@ -162,105 +160,11 @@ impl HoldersRepository for DatabaseConnection {
         let holder_account = owner_pubkeys.len();
         Ok(holder_account)
     }
-
-    // 在monitor阶段，接受不断产生的events，去更新数据库中数据
-    // 返回每个 mint 的 balance > 0 的 holder 数量
-    async fn upsert_holder_batch(&self, events: &[Event]) -> Result<Vec<(String, i64)>, Error> {
-        if events.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // 聚合数据
-        let aggregate_datas = aggregate_events(events);
-
-        // 收集所有需要的字段，包括 mint_pubkey
-        let mint_pubkeys: Vec<String> = aggregate_datas
-            .iter()
-            .map(|event| event.mint_pubkey.clone())
-            .collect();
-        let owner_pubkeys: Vec<String> = aggregate_datas
-            .iter()
-            .map(|event| event.owner_pubkey.clone())
-            .collect();
-        let deltas: Vec<String> = aggregate_datas
-            .iter()
-            .map(|event| event.balance.to_string())
-            .collect();
-        let last_updated_slots: Vec<i64> = aggregate_datas
-            .iter()
-            .map(|event| event.last_updated_slot)
-            .collect();
-
-        let mut tx = self.pool.begin().await?;
-
-        // 1. 执行 UPSERT 更新余额
-        sqlx::query!(
-            r#"
-            INSERT INTO holders (mint_pubkey, owner_pubkey, balance, last_updated_slot)
-            SELECT mint_pubkey, owner_pubkey, delta::numeric, last_updated_slot
-            FROM UNNEST($1::varchar[], $2::varchar[], $3::text[], $4::bigint[])
-                AS t(mint_pubkey, owner_pubkey, delta, last_updated_slot)
-            ON CONFLICT (mint_pubkey, owner_pubkey)
-            DO UPDATE SET
-                balance = holders.balance + EXCLUDED.balance,  -- 累加余额
-                last_updated_slot = EXCLUDED.last_updated_slot,
-                updated_at = now()
-            WHERE holders.last_updated_slot < EXCLUDED.last_updated_slot  -- 时效性检查
-            "#,
-            &mint_pubkeys,
-            &owner_pubkeys,
-            &deltas,
-            &last_updated_slots,
-        )
-        .execute(&mut *tx)
-        .await?;
-
-        // 2.删除余额为0的holder数据
-        let delete_result = sqlx::query!(
-            r#"
-      DELETE FROM holders AS h
-      USING UNNEST($1::varchar[], $2::varchar[]) AS t(mint_pubkey, owner_pubkey)
-      WHERE h.mint_pubkey = t.mint_pubkey
-        AND h.owner_pubkey = t.owner_pubkey
-        AND h.balance = 0
-      "#,
-            &mint_pubkeys,
-            &owner_pubkeys
-        )
-        .execute(&mut *tx)
-        .await?;
-
-        // 3. 统计每个 mint 的 holder 数量（balance > 0）
-        let unique_mints: HashSet<String> = events
-            .iter()
-            .map(|event| event.mint_pubkey.clone())
-            .collect();
-
-        let mut holder_counts: Vec<(String, i64)> = Vec::new();
-
-        for mint in unique_mints {
-            let count = sqlx::query_scalar!(
-                r#"
-                SELECT COUNT(*) as "count!"
-                FROM holders
-                WHERE mint_pubkey = $1 AND balance > 0
-                "#,
-                mint
-            )
-            .fetch_one(&mut *tx)
-            .await?;
-
-            holder_counts.push((mint, count));
-        }
-
-        tx.commit().await?; // 提交事务
-
-        Ok(holder_counts)
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
     use super::*;
     #[test]
     fn test_aggregate_token_holders() {
@@ -303,8 +207,9 @@ mod tests {
                 mint_pubkey: "DrZ26cKJDksVRWib3DVVsjo9eeXccc7hKhDJviiYEEZY".to_string(),
                 account_pubkey: "F3nV5qfyKJjgVg1vnnkDWwxkr9W1C2MpTTJwzcqCi53k".to_string(),
                 owner_pubkey: "G7yFPLBVcToFpz5cgmWCNjcAygVzT4m9VnX1FwCa3zqY".to_string(),
-                delta: Decimal::from_str("1").unwrap(),
-                confirmed: false,
+                delta: ClickhouseDecimal::from_f64(1.2),
+                confirmed: 0,
+                _timestamp: Utc::now()
             },
             Event {
                 slot: 5,
@@ -312,8 +217,9 @@ mod tests {
                 mint_pubkey: "DrZ26cKJDksVRWib3DVVsjo9eeXccc7hKhDJviiYEEZY".to_string(),
                 account_pubkey: "".to_string(),
                 owner_pubkey: "G7yFPLBVcToFpz5cgmWCNjcAygVzT4m9VnX1FwCa3zqY".to_string(),
-                delta: Decimal::from_str("-2").unwrap(),
-                confirmed: false,
+                delta: ClickhouseDecimal::from_f64(5.2),
+                confirmed: 0,
+                _timestamp: Utc::now()
             },
         ];
         let res = aggregate_events(&events);

@@ -197,7 +197,7 @@ impl Redis {
         };
 
         // 解析各个字段
-        let slot = get_and_parse("slot")?.parse::<i64>()?;
+        let slot = get_and_parse("slot")?.parse::<u64>()?;
         let tx_signature = get_and_parse("tx_sig")?;
         let instruction_index = get_and_parse("ix_idx")?.parse::<u32>()?;
 

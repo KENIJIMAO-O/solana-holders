@@ -1,23 +1,24 @@
 use crate::baseline::getProgramAccounts::TokenHolder;
 use crate::database::postgresql::DatabaseConnection;
 use crate::repositories::TokenAccountAggregateData;
-use crate::repositories::events::Event;
 use crate::utils::timer::TaskLogger;
 use anyhow::Error;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use yellowstone_grpc_proto::tonic::async_trait;
+use crate::clickhouse::clickhouse::Event;
+use crate::clickhouse::helper::ClickhouseDecimal;
 
 /// 聚合相同 account_pubkey 的 events，避免 ON CONFLICT 多次更新同一行
 pub fn aggregate_token_account_events(events: &[Event]) -> Vec<TokenAccountAggregateData> {
     // Key: account_pubkey, Value: (mint, owner, aggregated_delta, max_slot)
-    let mut aggregation_map: HashMap<String, (String, String, Decimal, i64)> = HashMap::new();
+    let mut aggregation_map: HashMap<String, (String, String, ClickhouseDecimal, u64)> = HashMap::new();
 
     for event in events {
         aggregation_map
             .entry(event.account_pubkey.clone())
             .and_modify(|(_, _, delta, slot)| {
-                *delta += event.delta;
+                *delta = *delta + event.delta;
                 *slot = (*slot).max(event.slot);
             })
             .or_insert((
@@ -36,7 +37,7 @@ pub fn aggregate_token_account_events(events: &[Event]) -> Vec<TokenAccountAggre
                 mint_pubkey: mint,
                 owner_pubkey: owner,
                 delta,
-                last_updated_slot: slot,
+                last_updated_slot: slot as i64,
             },
         )
         .collect()

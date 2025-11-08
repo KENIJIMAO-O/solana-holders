@@ -30,9 +30,10 @@ rust_decimal = { version = "1.35", features = ["serde-str"] }
 rdkafka = { version = "0.38.0", features = ["cmake-build"] }
 redis = { version = "0.32.6", features = ["tokio-comp"] }
 deadpool-redis = "0.22.0"
-sqlx = { version = "0.8.6",features = ["postgres", "runtime-tokio-rustls","macros","chrono", "rust_decimal"]}
+sqlx = { version = "0.8.6",features = ["postgres", "runtime-tokio-rustls", "macros", "chrono", "rust_decimal"]}
 chrono = "0.4"
-clickhouse = "0.12.2"
+clickhouse = { version = "0.14.0",features = ["chrono", "native-tls"]}
+fixnum = { version = "0.9", features = ["i16", "i32", "i64", "i128", "serde"] }
 
 # solana链上交互
 solana-client = "2.2.7"

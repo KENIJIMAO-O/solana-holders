@@ -103,7 +103,7 @@ pub fn create_test_token_event_with_index(index: u32) -> TokenEvent {
     let account = Pubkey::from_str("11111111111111111111111111111111").unwrap();
 
     TokenEvent {
-        slot: 12345 + index as i64,
+        slot: 12345 + index as u64,
         tx_signature: format!("test_sig_{}", index),
         instruction_index: index,
         mint_address: mint,
