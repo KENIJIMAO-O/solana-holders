@@ -1,9 +1,9 @@
-use anyhow::Error;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use crate::clickhouse::helper::ClickhouseDecimal;
+use crate::error::{DatabaseError, Result};
 
 /// todo!: 当前crate，仅用于数据验证，到生产环境就删除，审计记录结构
 #[derive(Debug, Clone)]
@@ -24,8 +24,9 @@ pub async fn insert_audit_records(
     max_slots: &[i64],
     total_balances: &HashMap<String, ClickhouseDecimal>,
     source: &str,
-) -> Result<(), Error> {
-    let audit_mints = std::env::var("AUDIT_MINTS").unwrap_or_default();
+) -> Result<()> {
+    let audit_mints: String = std::env::var("AUDIT_MINTS")
+        .expect("AUDIT_MINTS environment variable must be set");
     let audit_list: Vec<&str> = audit_mints.split(',').filter(|s| !s.is_empty()).collect();
 
     if audit_list.is_empty() {
@@ -51,7 +52,12 @@ pub async fn insert_audit_records(
                 source
             )
             .execute(&mut **tx)
-            .await?;
+            .await.map_err(
+                |e| DatabaseError::QueryFailed{
+                    query: format!("insert_audit_records: mint:{}", mint),
+                    source: e,
+                }
+            )?;
         }
     }
 
@@ -62,7 +68,7 @@ pub async fn get_mint_audit_history(
     pool: &PgPool,
     mint: &str,
     limit: i64,
-) -> Result<Vec<AuditRecord>, Error> {
+) -> Result<Vec<AuditRecord>> {
     let records = sqlx::query_as!(
         AuditRecord,
         r#"
@@ -77,7 +83,12 @@ pub async fn get_mint_audit_history(
         limit
     )
     .fetch_all(pool)
-    .await?;
+    .await.map_err(
+        |e| DatabaseError::QueryFailed {
+            query: "get_mint_audit_history".to_string(),
+            source: e,
+        }
+    )?;
 
     Ok(records)
 }
@@ -93,7 +104,8 @@ mod tests {
     fn test_read_from_env() {
         dotenv::dotenv().ok();
 
-        let audit_mints = std::env::var("AUDIT_MINTS").unwrap_or_default();
+        let audit_mints = std::env::var("AUDIT_MINTS")
+            .expect("AUDIT_MINTS environment variable must be set");
         println!("audit_mints: {}", audit_mints);
     }
 

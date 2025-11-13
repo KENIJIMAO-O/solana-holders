@@ -1,14 +1,12 @@
-use crate::baseline::getProgramAccounts::TokenHolder;
-use crate::database::postgresql::DatabaseConnection;
-use crate::utils::timer::TaskLogger;
-use anyhow::Error;
 use rust_decimal::Decimal;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap};
 use std::str::FromStr;
-use tracing::warn; // 或者你使用的其他日志库
-use yellowstone_grpc_proto::tonic::async_trait;
+use tracing::warn;
+use crate::baseline::get_program_accounts::TokenHolder;
+// 或者你使用的其他日志库
 use crate::clickhouse::clickhouse::Event;
 use crate::clickhouse::helper::ClickhouseDecimal;
+
 
 // 这是我们准备写入 holders 表的聚合后数据的结构体
 #[derive(Debug)]
@@ -88,78 +86,6 @@ pub fn aggregate_events(events: &[Event]) -> Vec<HolderUpsertData> {
         .collect();
 
     results
-}
-
-#[async_trait]
-pub trait HoldersRepository {
-    /// baseline时使用
-    async fn establish_holders_baseline(
-        &self,
-        token_accounts: &[TokenHolder],
-        logger: &mut TaskLogger,
-    ) -> Result<usize, Error>;
-}
-
-#[async_trait]
-impl HoldersRepository for DatabaseConnection {
-    async fn establish_holders_baseline(
-        &self,
-        token_accounts: &[TokenHolder],
-        logger: &mut TaskLogger,
-    ) -> Result<usize, Error> {
-        // 1. 调用聚合函数，得到处理好的数据
-        let aggregated_holders = aggregate_token_holders(token_accounts);
-        if aggregated_holders.is_empty() {
-            return Err(anyhow::anyhow!("empty token accounts"));
-        }
-
-        let mut tx = self.pool.begin().await?;
-
-        let mint_pubkeys = aggregated_holders
-            .iter()
-            .map(|aggregated_holder| aggregated_holder.mint_pubkey.clone())
-            .collect::<Vec<_>>();
-
-        let owner_pubkeys = aggregated_holders
-            .iter()
-            .map(|aggregated_holder| aggregated_holder.owner_pubkey.clone())
-            .collect::<Vec<_>>();
-
-        let balances: Vec<String> = aggregated_holders
-            .iter()
-            .map(|aggregated_holder| aggregated_holder.balance.to_string())
-            .collect::<Vec<_>>();
-
-        let last_updated_slots: Vec<i64> = aggregated_holders
-            .iter()
-            .map(|aggregated_holder| aggregated_holder.last_updated_slot as i64)
-            .collect();
-
-        sqlx::query!(
-            r#"
-            INSERT INTO holders
-                (mint_pubkey, owner_pubkey, balance, last_updated_slot)
-            SELECT mint_pubkey, owner_pubkey, balance::numeric, last_updated_slot
-            FROM UNNEST($1::varchar[], $2::varchar[], $3::text[], $4::bigint[])
-                AS t(mint_pubkey, owner_pubkey, balance, last_updated_slot)
-            ON CONFLICT(mint_pubkey, owner_pubkey)
-            DO UPDATE SET
-               balance = EXCLUDED.balance,
-               last_updated_slot = EXCLUDED.last_updated_slot,
-               updated_at = now()
-            "#,
-            &mint_pubkeys,
-            &owner_pubkeys,
-            &balances,
-            &last_updated_slots,
-        )
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-
-        let holder_account = owner_pubkeys.len();
-        Ok(holder_account)
-    }
 }
 
 #[cfg(test)]

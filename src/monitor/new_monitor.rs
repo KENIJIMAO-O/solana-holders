@@ -1,17 +1,14 @@
 use crate::EVENT_LOG_TARGET;
-use crate::message_queue::token_event_message_queue::Redis;
 use crate::monitor::client::GrpcClient;
 use crate::monitor::utils::constant::{TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID_2022};
 use crate::monitor::utils::utils::{
     convert_to_encoded_tx, subtract_as_decimal, txn_signature_to_string,
 };
 use crate::utils::timer::TaskLogger;
-use anyhow::{Error, anyhow};
+use crate::error::{GrpcError, ParseError, Result};
 use chrono::Local;
 use futures::SinkExt;
-use futures::future::join_all;
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 use solana_transaction_status_client_types::EncodedTransactionWithStatusMeta;
 use solana_transaction_status_client_types::option_serializer::OptionSerializer;
@@ -19,6 +16,7 @@ use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use serde::{Deserialize, Serialize};
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
@@ -26,7 +24,66 @@ use yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof;
 use yellowstone_grpc_proto::geyser::{CommitmentLevel, SubscribeRequest, SubscribeRequestPing};
 use yellowstone_grpc_proto::tonic::codegen::tokio_stream::StreamExt;
 use crate::kafka::KafkaMessageQueue;
-use crate::monitor::monitor::{InstructionType, MonitorConfig, ReConnectConfig, TokenEvent};
+
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TokenEvent {
+    // 唯一标识一个指令
+    pub slot: u64,
+    pub tx_signature: String,
+    pub instruction_index: u32,
+
+    // 代币核心信息
+    pub mint_address: Pubkey,
+    pub account_address: Pubkey,
+    pub owner_address: Option<Pubkey>,
+
+    // 余额变化
+    pub delta: String,
+
+    // 处理状态
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct MonitorConfig {
+    pub commitment: CommitmentLevel,
+}
+
+impl MonitorConfig {
+    pub fn new() -> Self {
+        let commitment = env::var("COMMITMENT").unwrap_or_else(|_| "Finalized".to_string());
+        let commitment_level = match commitment.as_str() {
+            "Processed" => CommitmentLevel::Processed,
+            "Confirmed" => CommitmentLevel::Confirmed,
+            "Finalized" => CommitmentLevel::Finalized,
+            _ => CommitmentLevel::Finalized,
+        };
+
+        Self {
+            commitment: commitment_level,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ReConnectConfig {
+    pub reconnect_count: AtomicU32,   // 当前的重连次数
+    pub max_reconnect_attempts: u32,  // 最大重连次数
+    pub initial_backoff_seconds: u64, // 初始重连间隔
+    pub max_backoff_seconds: u64,     // 最大重连间隔
+}
+
+impl Default for ReConnectConfig {
+    fn default() -> Self {
+        Self {
+            reconnect_count: AtomicU32::new(0),
+            max_reconnect_attempts: 5,
+            initial_backoff_seconds: 1,
+            max_backoff_seconds: 300,
+        }
+    }
+}
 
 pub struct NewMonitor {
     config: MonitorConfig,
@@ -53,7 +110,7 @@ impl NewMonitor {
     pub async fn run_with_reconnect(
         &mut self,
         cancellation_token: CancellationToken,
-    ) -> anyhow::Result<(), Error> {
+    ) -> Result<()> {
         info!("Monitor starting with auto-reconnect capability");
 
         loop {
@@ -71,7 +128,10 @@ impl NewMonitor {
                     "Maximum reconnection attempts ({}) exceeded, stopping monitor",
                     self.reconnect_config.max_reconnect_attempts
                 );
-                return Err(anyhow!("Maximum reconnection attempts exceeded"));
+                return Err(GrpcError::ConnectionFailed {
+                    url: "gRPC stream".to_string(),
+                    source: Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut, "Maximum reconnection attempts exceeded")),
+                }.into());
             }
 
             // 如果不是第一次连接，需要等待退避时间
@@ -121,7 +181,7 @@ impl NewMonitor {
     async fn run_single_connection(
         &mut self,
         cancellation_token: CancellationToken,
-    ) -> Result<(), Error> {
+    ) -> Result<()> {
         let token_program = TOKEN_PROGRAM_ID.to_string();
         let token_program_2022 = TOKEN_PROGRAM_ID_2022.to_string();
         let targets = vec![token_program, token_program_2022];
@@ -134,7 +194,8 @@ impl NewMonitor {
         let (mut subscribe_tx, mut stream) = self
             .client
             .subscribe_block(targets, Some(true), None, self.config.commitment)
-            .await?;
+            .await
+            .map_err(|e| GrpcError::SubscriptionFailed(format!("Failed to subscribe: {}", e)))?;
 
         info!("Monitor subscription established, processing blocks");
 
@@ -199,12 +260,12 @@ impl NewMonitor {
                         Some(Err(e)) => {
                             error!("Stream error: {:?}", e);
                             connection_monitor.abort();
-                            return Err(anyhow!("Stream error: {}", e));
+                            return Err(GrpcError::StreamError(format!("Stream error: {}", e)).into());
                         }
                         None => {
                             warn!("Monitor stream ended unexpectedly");
                             connection_monitor.abort();
-                            return Err(anyhow!("Stream ended unexpectedly"));
+                            return Err(GrpcError::StreamEnded.into());
                         }
                     }
 
@@ -221,7 +282,7 @@ impl NewMonitor {
     async fn process_block(
         &self,
         sub_block: yellowstone_grpc_proto::geyser::SubscribeUpdateBlock,
-    ) -> Result<(), Error> {
+    ) -> Result<()> {
         Self::process_block_static(sub_block, Arc::clone(&self.message_queue)).await
     }
 
@@ -229,7 +290,7 @@ impl NewMonitor {
     async fn process_block_static(
         sub_block: yellowstone_grpc_proto::geyser::SubscribeUpdateBlock,
         message_queue: Arc<KafkaMessageQueue>,
-    ) -> Result<(), Error> {
+    ) -> Result<()> {
         let block_slot = sub_block.slot;
         let tx_count = sub_block.transactions.len();
         info!("📦 Slot {}: 开始处理 {} 笔交易", block_slot, tx_count);
@@ -259,7 +320,8 @@ impl NewMonitor {
                 })
                 .collect::<Vec<TokenEvent>>()
         })
-            .await?;
+            .await
+            .map_err(|e| GrpcError::StreamError(format!("Spawn blocking failed: {}", e)))?;
         let target_instruction_count = all_events.len();
 
         // 批量发送到消息队列
@@ -281,7 +343,7 @@ impl NewMonitor {
         &self,
         all_events: Vec<TokenEvent>,
         monitor_logger: &mut TaskLogger,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         if !all_events.is_empty() {
             self.message_queue
                 .batch_enqueue_holder_event(all_events, monitor_logger)
@@ -295,11 +357,14 @@ impl NewMonitor {
         transaction: EncodedTransactionWithStatusMeta,
         sig: String,
         block_slot: u64,
-    ) -> Result<Vec<TokenEvent>, Error> {
+    ) -> Result<Vec<TokenEvent>> {
         let meta = transaction
             .meta
             .as_ref()
-            .ok_or_else(|| anyhow!("无 Meta 数据"))?;
+            .ok_or_else(|| ParseError::MissingMeta {
+                slot: block_slot,
+                sig: sig.clone(),
+            })?;
         debug!(target: EVENT_LOG_TARGET, "slot:{}, sig:{:?}", block_slot, sig);
 
         // 判断当前交易是否成功(如果失败，不做任何动作直接返回)
@@ -310,7 +375,10 @@ impl NewMonitor {
         let tx = transaction
             .transaction
             .decode()
-            .ok_or_else(|| anyhow!("无法解码交易"))?;
+            .ok_or_else(|| ParseError::TransactionDecodeFailed {
+                slot: block_slot,
+                sig: sig.clone(),
+            })?;
 
         // 组装当前交易所有 account_keys
         let mut account_keys = tx.message.static_account_keys().to_vec();
@@ -318,17 +386,16 @@ impl NewMonitor {
         // 如果有 loaded_addresses，就追加到 account_keys
         if meta.loaded_addresses.is_some() {
             let loaded_address = meta.loaded_addresses.as_ref().unwrap();
-
             // 获取可写和只读动态账户
             let write_address = &loaded_address
                 .writable
                 .iter()
-                .map(|addr| Pubkey::from_str_const(&addr))
+                .map(|addr| Pubkey::from_str_const(addr))
                 .collect::<Vec<_>>();
             let read_address = &loaded_address
                 .readonly
                 .iter()
-                .map(|addr| Pubkey::from_str_const(&addr))
+                .map(|addr| Pubkey::from_str_const(addr))
                 .collect::<Vec<_>>();
 
             account_keys.extend(write_address);
@@ -373,7 +440,7 @@ impl NewMonitor {
                             let delta = subtract_as_decimal(
                                 &post_balance.ui_token_amount.ui_amount_string,
                                 &pre_balance.ui_token_amount.ui_amount_string,
-                            )?;
+                            ).map_err(|e| ParseError::InvalidFormat(format!("Failed to parse decimal: {}", e)))?;
 
                             let owner = match &post_balance.owner {
                                 OptionSerializer::Some(owner) => {
@@ -385,8 +452,9 @@ impl NewMonitor {
                             // 关键：通过account_index获取真实的token account地址
                             let token_account = *account_keys
                                 .get(pre_balance.account_index as usize)
-                                .ok_or_else(|| {
-                                    anyhow!("Invalid account_index: {}", pre_balance.account_index)
+                                .ok_or_else(|| ParseError::AccountIndexOutOfBounds {
+                                    index: pre_balance.account_index as usize,
+                                    sig: sig.clone(),
                                 })?;
 
                             let token_event = TokenEvent {
@@ -397,7 +465,6 @@ impl NewMonitor {
                                 account_address: token_account,
                                 owner_address: owner,
                                 delta,
-                                instruction_type: InstructionType::Other, // 简化，不关注具体类型
                                 confirmed: false,
                             };
                             events.push(token_event);
@@ -422,8 +489,9 @@ impl NewMonitor {
 
                             let token_account = *account_keys
                                 .get(pre_balance.account_index as usize)
-                                .ok_or_else(|| {
-                                    anyhow!("Invalid account_index: {}", pre_balance.account_index)
+                                .ok_or_else(|| ParseError::AccountIndexOutOfBounds {
+                                    index: pre_balance.account_index as usize,
+                                    sig: sig.clone(),
                                 })?;
 
                             let token_event = TokenEvent {
@@ -434,7 +502,6 @@ impl NewMonitor {
                                 account_address: token_account,
                                 owner_address: owner,
                                 delta,
-                                instruction_type: InstructionType::Other,
                                 confirmed: false,
                             };
                             events.push(token_event);
@@ -463,8 +530,9 @@ impl NewMonitor {
 
                         let token_account = *account_keys
                             .get(post_balance.account_index as usize)
-                            .ok_or_else(|| {
-                                anyhow!("Invalid account_index: {}", post_balance.account_index)
+                            .ok_or_else(|| ParseError::AccountIndexOutOfBounds {
+                                index: post_balance.account_index as usize,
+                                sig: sig.clone(),
                             })?;
 
                         let token_event = TokenEvent {
@@ -475,7 +543,6 @@ impl NewMonitor {
                             account_address: token_account,
                             owner_address: owner,
                             delta,
-                            instruction_type: InstructionType::Other,
                             confirmed: false,
                         };
                         events.push(token_event);
@@ -490,6 +557,7 @@ impl NewMonitor {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use crate::kafka::KafkaQueueConfig;
     use super::*;
 

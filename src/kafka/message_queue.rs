@@ -1,7 +1,7 @@
 use crate::kafka::config::KafkaQueueConfig;
-use crate::monitor::monitor::TokenEvent;
+use crate::monitor::new_monitor::TokenEvent;
 use crate::utils::timer::TaskLogger;
-use anyhow::{Error, anyhow};
+use crate::error::{KafkaError, Result, ValidationError};
 use futures::future;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::stream_consumer::StreamConsumer;
@@ -26,13 +26,13 @@ pub struct KafkaMessageQueue {
 
 impl KafkaMessageQueue {
     /// 创建新的 Kafka 消息队列实例
-    pub fn new(config: KafkaQueueConfig) -> Result<Self, Error> {
+    pub fn new(config: KafkaQueueConfig) -> Result<Self> {
         // 创建 Producer
         let producer: FutureProducer = ClientConfig::new()
             .set("bootstrap.servers", &config.bootstrap_servers)
             .set("message.timeout.ms", &config.producer_timeout_ms)
             .create()
-            .map_err(|e| anyhow!("Failed to create Kafka producer: {}", e))?;
+            .map_err(|e| KafkaError::ProducerCreationFailed(format!("Failed to create Kafka producer: {}", e)))?;
 
         info!(
             "✅ [KAFKA] Producer created successfully, bootstrap servers: {}",
@@ -53,7 +53,7 @@ impl KafkaMessageQueue {
         consumer_name: &str,
         topic: &str,
         consumer_group: &str,
-    ) -> Result<Arc<StreamConsumer>, Error> {
+    ) -> Result<Arc<StreamConsumer>> {
         let mut consumers = self.consumers.lock().await;
 
         // 如果已经存在，直接返回
@@ -84,12 +84,12 @@ impl KafkaMessageQueue {
             // 4. 增加每次 poll 返回的最大字节数（默认 1MB，提升到 10MB）
             .set("max.partition.fetch.bytes", "10485760") // 10 MB
             .create()
-            .map_err(|e| anyhow!("Failed to create Kafka consumer: {}", e))?;
+            .map_err(|e| KafkaError::ConsumerCreationFailed(format!("Failed to create Kafka consumer: {}", e)))?;
 
         // 订阅 topic
         consumer
             .subscribe(&[topic])
-            .map_err(|e| anyhow!("Failed to subscribe to topic {}: {}", topic, e))?;
+            .map_err(|e| KafkaError::ReceiveFailed(format!("Failed to subscribe to topic {}: {}", topic, e)))?;
 
         info!(
             "✅ [KAFKA] Consumer '{}' created and subscribed to topic '{}'",
@@ -109,9 +109,9 @@ impl KafkaMessageQueue {
         &self,
         token_events: Vec<TokenEvent>,
         logger: &mut TaskLogger,
-    ) -> Result<Vec<String>, Error> {
+    ) -> Result<Vec<String>> {
         if token_events.is_empty() {
-            return Err(anyhow!("empty token event"));
+            return Err(ValidationError::EmptyData("token events".to_string()).into());
         }
 
         logger.log("start to batch sending messages to kafka");
@@ -120,8 +120,8 @@ impl KafkaMessageQueue {
         let mut keys = Vec::with_capacity(token_events.len());
 
         for event in token_events {
-            let payload =
-                serde_json::to_string(&event).map_err(|e| anyhow!("Serialization error: {}", e))?;
+            let payload = serde_json::to_string(&event)
+                .map_err(|e| KafkaError::SerializationFailed(format!("Serialization error: {}", e)))?;
 
             // 使用 mint_address 作为 key，确保同一代币的消息进入同一分区（保证顺序）
             let key = event.mint_address.to_string();
@@ -155,7 +155,10 @@ impl KafkaMessageQueue {
                 }
                 Err((e, _)) => {
                     warn!("Failed to send message #{} to Kafka: {}", idx, e);
-                    return Err(anyhow!("Failed to send message #{}: {}", idx, e));
+                    return Err(KafkaError::SendFailed {
+                        topic: self.config.token_event_topic.clone(),
+                        reason: format!("Failed to send message #{}: {}", idx, e),
+                    }.into());
                 }
             }
         }
@@ -175,7 +178,7 @@ impl KafkaMessageQueue {
         max_count: usize,
         block_ms: usize,
         logger: &mut TaskLogger,
-    ) -> Result<Vec<(String, TokenEvent)>, Error> {
+    ) -> Result<Vec<(String, TokenEvent)>> {
         logger.log("start to getting or creating consumer");
 
         // 获取或创建 consumer
@@ -205,7 +208,8 @@ impl KafkaMessageQueue {
             match tokio::time::timeout(remaining, consumer.recv()).await {
                 Ok(Ok(msg)) => {
                     // 成功接收到消息
-                    let payload = msg.payload().ok_or_else(|| anyhow!("Empty payload"))?;
+                    let payload = msg.payload()
+                        .ok_or_else(|| KafkaError::ReceiveFailed("Empty payload".to_string()))?;
 
                     // 反序列化
                     match serde_json::from_slice::<TokenEvent>(payload) {
@@ -222,13 +226,14 @@ impl KafkaMessageQueue {
                                 e
                             );
                             // 反序列化失败的消息直接提交 offset 跳过
-                            consumer.commit_message(&msg, CommitMode::Async)?;
+                            consumer.commit_message(&msg, CommitMode::Async)
+                                .map_err(|e| KafkaError::ReceiveFailed(format!("Failed to commit message: {}", e)))?;
                         }
                     }
                 }
                 Ok(Err(e)) => {
                     warn!("Kafka consumer error: {}", e);
-                    return Err(anyhow!("Kafka consumer error: {}", e));
+                    return Err(KafkaError::ReceiveFailed(format!("Kafka consumer error: {}", e)).into());
                 }
                 Err(_) => {
                     // 超时，返回已收集的消息
@@ -249,18 +254,17 @@ impl KafkaMessageQueue {
     /// todo!: 后续可能还是需要指定消费者
     // === 更改后 (ack_token_events) ===
     /// 确认 TokenEvent 消息已处理（提交指定 consumer 的 offset）
-    pub async fn ack_token_events(&self, consumer_name: &str) -> Result<(), Error> {
+    pub async fn ack_token_events(&self, consumer_name: &str) -> Result<()> {
         let consumers = self.consumers.lock().await;
 
         // 只提交你真正想提交的那个 consumer
         if let Some(consumer) = consumers.get(consumer_name) {
-            match consumer.commit_consumer_state(CommitMode::Async) {
-                Ok(_) => Ok(()),
-                Err(e) => {
+            consumer.commit_consumer_state(CommitMode::Async)
+                .map_err(|e| {
                     warn!("Failed to commit consumer '{}' state: {}", consumer_name, e);
-                    Err(e.into()) // 向上层报告错误
-                }
-            }
+                    KafkaError::ReceiveFailed(format!("Failed to commit consumer state: {}", e))
+                })?;
+            Ok(())
         } else {
             warn!("Attempted to ack non-existent consumer: {}", consumer_name);
             // 这是一个逻辑错误，但可能不是致命的，取决于你的业务
@@ -272,7 +276,7 @@ impl KafkaMessageQueue {
 
     /// 批量发送 baseline 任务到 Kafka（优化版：并发发送）
     /// 对应 Redis 的 batch_enqueue_baseline_task
-    pub async fn batch_enqueue_baseline_task(&self, mints: &[String]) -> Result<(), Error> {
+    pub async fn batch_enqueue_baseline_task(&self, mints: &[String]) -> Result<()> {
         if mints.is_empty() {
             return Ok(());
         }
@@ -310,7 +314,10 @@ impl KafkaMessageQueue {
         for (idx, result) in results.into_iter().enumerate() {
             if let Err((e, _)) = result {
                 warn!("Failed to send baseline task #{} to Kafka: {}", idx, e);
-                return Err(anyhow!("Failed to send baseline task #{}: {}", idx, e));
+                return Err(KafkaError::SendFailed {
+                    topic: self.config.baseline_topic.clone(),
+                    reason: format!("Failed to send baseline task #{}: {}", idx, e),
+                }.into());
             }
         }
 
@@ -325,7 +332,7 @@ impl KafkaMessageQueue {
         consumer_name: &str,
         max_count: usize,
         block_ms: usize,
-    ) -> Result<Vec<(String, String)>, Error> {
+    ) -> Result<Vec<(String, String)>> {
         let start = Instant::now();
 
         // 获取或创建 consumer（已优化配置：批量拉取）
@@ -350,11 +357,12 @@ impl KafkaMessageQueue {
 
             match tokio::time::timeout(remaining, consumer.recv()).await {
                 Ok(Ok(msg)) => {
-                    let payload = msg.payload().ok_or_else(|| anyhow!("Empty payload"))?;
+                    let payload = msg.payload()
+                        .ok_or_else(|| KafkaError::ReceiveFailed("Empty payload".to_string()))?;
 
                     // 解析 JSON: {"mint_pubkey": "..."}
                     let payload_str = std::str::from_utf8(payload)
-                        .map_err(|e| anyhow!("Invalid UTF-8: {}", e))?;
+                        .map_err(|e| KafkaError::SerializationFailed(format!("Invalid UTF-8: {}", e)))?;
 
                     match serde_json::from_str::<serde_json::Value>(payload_str) {
                         Ok(json) => {
@@ -364,18 +372,20 @@ impl KafkaMessageQueue {
                                 baseline_tasks.push((msg_id, mint_str.to_string()));
                             } else {
                                 warn!("Message missing 'mint_pubkey' field, skipping");
-                                consumer.commit_message(&msg, CommitMode::Async)?;
+                                consumer.commit_message(&msg, CommitMode::Async)
+                                    .map_err(|e| KafkaError::ReceiveFailed(format!("Failed to commit message: {}", e)))?;
                             }
                         }
                         Err(e) => {
                             warn!("Failed to parse baseline task JSON: {}", e);
-                            consumer.commit_message(&msg, CommitMode::Async)?;
+                            consumer.commit_message(&msg, CommitMode::Async)
+                                .map_err(|e| KafkaError::ReceiveFailed(format!("Failed to commit message: {}", e)))?;
                         }
                     }
                 }
                 Ok(Err(e)) => {
                     warn!("Kafka consumer error: {}", e);
-                    return Err(anyhow!("Kafka consumer error: {}", e));
+                    return Err(KafkaError::ReceiveFailed(format!("Kafka consumer error: {}", e)).into());
                 }
                 Err(_) => {
                     // 超时，返回已收集的任务
@@ -397,17 +407,16 @@ impl KafkaMessageQueue {
     }
 
     /// 确认 Baseline 任务已处理（提交指定 consumer 的 offset）
-    pub async fn ack_baseline_tasks(&self, consumer_name: &str) -> Result<(), Error> {
+    pub async fn ack_baseline_tasks(&self, consumer_name: &str) -> Result<()> {
         let consumers = self.consumers.lock().await;
 
         if let Some(consumer) = consumers.get(consumer_name) {
-            match consumer.commit_consumer_state(CommitMode::Async) {
-                Ok(_) => Ok(()),
-                Err(e) => {
+            consumer.commit_consumer_state(CommitMode::Async)
+                .map_err(|e| {
                     warn!("Failed to commit baseline consumer '{}' state: {}", consumer_name, e);
-                    Err(e.into())
-                }
-            }
+                    KafkaError::ReceiveFailed(format!("Failed to commit consumer state: {}", e))
+                })?;
+            Ok(())
         } else {
             warn!("Attempted to ack non-existent consumer: {}", consumer_name);
             Ok(())

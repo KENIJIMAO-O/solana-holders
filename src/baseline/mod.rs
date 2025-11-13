@@ -1,7 +1,8 @@
 use serde::Deserialize;
 use std::time::Duration;
+use crate::error::{BaselineError, ConfigError, Result};
 
-pub mod getProgramAccounts;
+pub mod get_program_accounts;
 pub mod token_meta;
 
 #[derive(Clone, Debug)]
@@ -12,7 +13,7 @@ pub struct HttpClient {
 }
 
 impl HttpClient {
-    pub fn new(rpc_url: String, sol_scan_token: String) -> anyhow::Result<Self> {
+    pub fn new(rpc_url: String, sol_scan_token: String) -> Result<Self> {
         let http_client = reqwest::Client::builder()
             .pool_max_idle_per_host(20)
             .pool_idle_timeout(Duration::from_secs(60))
@@ -20,7 +21,9 @@ impl HttpClient {
             .timeout(Duration::from_secs(1600))
             .tcp_keepalive(Duration::from_secs(30))
             .build()
-            .map_err(|e| anyhow::anyhow!("Failed to create batch HTTP client: {}", e))?;
+            .map_err(|e| BaselineError::ClientCreationFailed(
+                format!("Failed to create HTTP client: {}", e)
+            ))?;
         Ok(Self {
             rpc_url,
             sol_scan_token,
@@ -31,8 +34,10 @@ impl HttpClient {
 
 impl Default for HttpClient {
     fn default() -> Self {
-        let rpc_url = std::env::var("RPC_URL").unwrap();
-        let sol_scan_token = std::env::var("SOLSCAN_API_KEY").unwrap();
+        let rpc_url = std::env::var("RPC_URL")
+            .expect("RPC_URL environment variable must be set");
+        let sol_scan_token = std::env::var("SOLSCAN_API_KEY")
+            .expect("SOLSCAN_API_KEY environment variable must be set");
         let http_client = reqwest::Client::builder()
             .pool_max_idle_per_host(20)
             .pool_idle_timeout(Duration::from_secs(60))
@@ -40,8 +45,7 @@ impl Default for HttpClient {
             .timeout(Duration::from_secs(1600))
             .tcp_keepalive(Duration::from_secs(30))
             .build()
-            .map_err(|e| anyhow::anyhow!("Failed to create batch HTTP client: {}", e))
-            .unwrap();
+            .expect("Failed to create HTTP client");
         Self {
             rpc_url,
             sol_scan_token,

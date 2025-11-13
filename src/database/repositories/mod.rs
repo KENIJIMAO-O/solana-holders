@@ -1,13 +1,12 @@
-use crate::baseline::getProgramAccounts::TokenHolder;
-use crate::database::postgresql::DatabaseConnection;
-use crate::repositories::token_accounts::aggregate_token_account_events;
-use anyhow::Error;
-use rust_decimal::Decimal;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use tracing::info;
 use yellowstone_grpc_proto::tonic::async_trait;
+use crate::baseline::get_program_accounts::TokenHolder;
 use crate::clickhouse::clickhouse::{ClickHouse, Event};
 use crate::clickhouse::helper::ClickhouseDecimal;
+use crate::database::postgresql::DatabaseConnection;
+use crate::database::repositories::token_accounts::aggregate_token_account_events;
+use crate::error::{DatabaseError, Result};
 
 pub mod audit;
 pub mod holders;
@@ -30,7 +29,7 @@ pub(crate) struct TokenAccountAggregateData {
 #[async_trait]
 pub trait AtomicityData {
     /// 原子性更新三张表（用于实时监听的 synced mint）
-    async fn upsert_synced_mints_atomic(&self, synced_events: &[Event], clickhouse: &ClickHouse) -> anyhow::Result<()>;
+    async fn upsert_synced_mints_atomic(&self, synced_events: &[Event], clickhouse: &ClickHouse) -> Result<()>;
 
     /// 原子性建立 baseline（用于初次构建 baseline）
     /// 返回 baseline_slot
@@ -38,7 +37,7 @@ pub trait AtomicityData {
         &self,
         mint: &str,
         token_accounts: &[TokenHolder],
-    ) -> anyhow::Result<i64>;
+    ) -> Result<i64>;
 }
 
 /// 受内存爆炸问题困扰，下面需要对两个函数进行分块处理（流式处理暂不可用，只有getProgramAccountV2支持，但是我们不可能全部使用helius节点）
@@ -49,13 +48,16 @@ impl AtomicityData for DatabaseConnection {
         &self,
         synced_events: &[Event],
         clickhouse: &ClickHouse
-    ) -> Result<(), Error> {
+    ) -> Result<()> {
         if synced_events.is_empty() {
             return Ok(());
         }
 
         info!("start upserting synced mints atomic");
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin().await
+            .map_err(|e| DatabaseError::TransactionFailed(
+                format!("upsert_synced_mints_atomic: {:?}", e)
+            ))?;
 
         // 1.0 聚合 token_accounts 数据（避免同一个 account 多次更新）
         let aggregated_accounts = aggregate_token_account_events(synced_events);
@@ -104,9 +106,12 @@ impl AtomicityData for DatabaseConnection {
             &slots,
         )
         .execute(&mut *tx)
-        .await?;
+        .await.map_err(|e| DatabaseError::QueryFailed {
+            query: "upsert_synced_mints_atomic: upsert token_accounts".to_string(),
+            source: e,
+        })?;
+
         // 1.2 删除 token_accounts中 balance 为 0 的数据
-        info!("start deleting token_account in token_accounts who's balance equals 0");
         sqlx::query!(
             r#"
         DELETE FROM token_accounts
@@ -115,7 +120,10 @@ impl AtomicityData for DatabaseConnection {
             &account_pubkeys,
         )
         .execute(&mut *tx)
-        .await?;
+        .await.map_err(|e| DatabaseError::QueryFailed {
+            query: "upsert_synced_mints_atomic: deleting token_account".to_string(),
+            source: e,
+        })?;
 
         // 2.0 聚合 synced_events（合并同一个 (mint, owner) 的多个事件）
         let aggregate_datas = holders::aggregate_events(synced_events);
@@ -160,7 +168,11 @@ impl AtomicityData for DatabaseConnection {
             &holder_slots,
         )
         .execute(&mut *tx)
-        .await?;
+        .await.map_err(|e| DatabaseError::QueryFailed {
+            query: "upsert_synced_mints_atomic: upsert holders".to_string(),
+            source: e,
+        })?;
+
         // 2.2 删除 balance 为 0 的数据
         info!("start deleting holder in holders who's balance equals 0");
         sqlx::query!(
@@ -171,7 +183,10 @@ impl AtomicityData for DatabaseConnection {
             &holder_owner_pubkeys,
         )
         .execute(&mut *tx)
-        .await?;
+        .await.map_err(|e| DatabaseError::QueryFailed {
+            query: "upsert_synced_mints_atomic: delete holders with zero balance".to_string(),
+            source: e,
+        })?;
 
         // 3. 为每个 mint 计算其最大 slot
         use std::collections::HashMap;
@@ -201,7 +216,10 @@ impl AtomicityData for DatabaseConnection {
                 mint
             )
             .fetch_one(&mut *tx) // 关键：在同一事务中
-            .await?;
+            .await.map_err(|e| DatabaseError::QueryFailed {
+                query: format!("upsert_synced_mints_atomic: count holders for mint {}", mint),
+                source: e,
+            })?;
 
             holder_counts.push((mint, count));
         }
@@ -238,7 +256,10 @@ impl AtomicityData for DatabaseConnection {
             &max_slots,
         )
         .execute(&mut *tx)
-        .await?;
+        .await.map_err(|e| DatabaseError::QueryFailed {
+            query: "upsert_synced_mints_atomic: upsert mint_stats".to_string(),
+            source: e,
+        })?;
 
         // 6. 审计：记录 mint_stats 变化历史（如果在审计列表中）
         let mut total_balances: HashMap<String, ClickhouseDecimal> = HashMap::new();
@@ -260,7 +281,9 @@ impl AtomicityData for DatabaseConnection {
         .await?;
 
         // todo!: 因为使用的两个数据库就是不一样，所以导致现有的框架无法保证两个数据库的数据更新呈现原子性
-        tx.commit().await?;
+        tx.commit().await.map_err(|e| DatabaseError::TransactionFailed(
+            format!("upsert_synced_mints_atomic: commit failed: {:?}", e)
+        ))?;
         clickhouse.confirm_events(synced_events).await?;
 
         Ok(())
@@ -270,13 +293,18 @@ impl AtomicityData for DatabaseConnection {
         &self,
         mint: &str,
         token_accounts: &[TokenHolder],
-    ) -> Result<i64, Error> {
+    ) -> Result<i64> {
         if token_accounts.is_empty() {
-            return Err(anyhow::anyhow!("empty token accounts"));
+            return Err(crate::error::ValidationError::EmptyData(
+                "establish_baseline_atomic: token_accounts is empty".to_string()
+            ).into());
         }
 
         const CHUNK_SIZE: usize = 2000;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin().await
+            .map_err(|e| DatabaseError::TransactionFailed(
+                format!("establish_baseline_atomic: begin transaction failed: {:?}", e)
+            ))?;
 
         // 1. 插入 token_accounts（分块处理以减少内存峰值）
         for chunk in token_accounts.chunks(CHUNK_SIZE) {
@@ -317,7 +345,10 @@ impl AtomicityData for DatabaseConnection {
                 &last_updated_slots,
             )
             .execute(&mut *tx)
-            .await?;
+            .await.map_err(|e| DatabaseError::QueryFailed {
+                query: "establish_baseline_atomic: insert token_accounts".to_string(),
+                source: e,
+            })?;
         }
 
         // 2. 聚合数据并插入 holders
@@ -355,7 +386,10 @@ impl AtomicityData for DatabaseConnection {
             &holder_slots,
         )
         .execute(&mut *tx)
-        .await?;
+        .await.map_err(|e| DatabaseError::QueryFailed {
+            query: "establish_baseline_atomic: insert holders".to_string(),
+            source: e,
+        })?;
 
         // 3. 插入 mint_stats
         let holder_count = holder_owner_pubkeys.len() as i64;
@@ -378,9 +412,14 @@ impl AtomicityData for DatabaseConnection {
             baseline_slot,
         )
         .execute(&mut *tx)
-        .await?;
+        .await.map_err(|e| DatabaseError::QueryFailed {
+            query: "establish_baseline_atomic: insert mint_stats".to_string(),
+            source: e,
+        })?;
 
-        tx.commit().await?;
+        tx.commit().await.map_err(|e| DatabaseError::TransactionFailed(
+            format!("establish_baseline_atomic: commit failed: {:?}", e)
+        ))?;
         Ok(baseline_slot)
     }
 }

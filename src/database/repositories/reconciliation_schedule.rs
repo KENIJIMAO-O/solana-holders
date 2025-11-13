@@ -1,5 +1,5 @@
 use crate::database::postgresql::DatabaseConnection;
-use anyhow::Error;
+use crate::error::{DatabaseError, ValidationError, Result};
 use sqlx::types::chrono::{DateTime, Utc};
 use yellowstone_grpc_proto::tonic::async_trait;
 
@@ -9,7 +9,7 @@ pub struct ReconciliationSchedule {
     pub last_reconciliation_time: DateTime<Utc>,
     pub last_holder_count: i64,
     pub next_reconciliation_time: DateTime<Utc>,
-    pub current_interval_hours: i32,
+    pub current_interval_hours: i32,             // 当前对账间隔
     pub total_reconciliations: i32,
 }
 
@@ -20,10 +20,10 @@ pub trait ReconciliationScheduleRepository {
         &self,
         mint_pubkeys: &[String],
         holder_counts: &[i64],
-    ) -> Result<(), Error>;
+    ) -> Result<()>;
 
     /// 查询到期需要对账的 mints
-    async fn get_due_mints(&self) -> Result<Vec<ReconciliationSchedule>, Error>;
+    async fn get_due_mints(&self) -> Result<Vec<ReconciliationSchedule>>;
 
     /// 对账后更新调度信息
     async fn update_schedule_after_reconciliation(
@@ -31,7 +31,7 @@ pub trait ReconciliationScheduleRepository {
         mint_pubkey: &str,
         current_holder_count: i64,
         next_interval_hours: i32,
-    ) -> Result<(), Error>;
+    ) -> Result<()>;
 }
 
 #[async_trait]
@@ -40,16 +40,17 @@ impl ReconciliationScheduleRepository for DatabaseConnection {
         &self,
         mint_pubkeys: &[String],
         holder_counts: &[i64],
-    ) -> Result<(), Error> {
+    ) -> Result<()> {
         if mint_pubkeys.is_empty() {
             return Ok(());
         }
 
         // 确保两个数组长度一致
         if mint_pubkeys.len() != holder_counts.len() {
-            return Err(anyhow::anyhow!(
-                "mint_pubkeys and holder_counts length mismatch"
-            ));
+            return Err(ValidationError::InvalidParameter {
+                field: "mint_pubkeys and holder_counts".to_string(),
+                reason: "length mismatch".to_string(),
+            }.into());
         }
 
         sqlx::query!(
@@ -72,12 +73,16 @@ impl ReconciliationScheduleRepository for DatabaseConnection {
             holder_counts,
         )
         .execute(&self.pool)
-        .await?;
+        .await.map_err(|e| DatabaseError::QueryFailed {
+            query: "initialize_schedule_batch: insert reconciliation_schedule".to_string(),
+            source: e,
+        })?;
 
         Ok(())
     }
 
-    async fn get_due_mints(&self) -> Result<Vec<ReconciliationSchedule>, Error> {
+    // todo！：感觉这里一下子查所有，有点太多了，对内存来说又是一个不小的压力
+    async fn get_due_mints(&self) -> Result<Vec<ReconciliationSchedule>> {
         let records = sqlx::query!(
             r#"
             SELECT
@@ -93,7 +98,10 @@ impl ReconciliationScheduleRepository for DatabaseConnection {
             "#,
         )
         .fetch_all(&self.pool)
-        .await?;
+        .await.map_err(|e| DatabaseError::QueryFailed {
+            query: "get_due_mints: query reconciliation_schedule".to_string(),
+            source: e,
+        })?;
 
         let schedules = records
             .into_iter()
@@ -115,7 +123,7 @@ impl ReconciliationScheduleRepository for DatabaseConnection {
         mint_pubkey: &str,
         current_holder_count: i64,
         next_interval_hours: i32,
-    ) -> Result<(), Error> {
+    ) -> Result<()> {
         sqlx::query!(
             r#"
             UPDATE reconciliation_schedule
@@ -133,7 +141,10 @@ impl ReconciliationScheduleRepository for DatabaseConnection {
             next_interval_hours
         )
         .execute(&self.pool)
-        .await?;
+        .await.map_err(|e| DatabaseError::QueryFailed {
+            query: format!("update_schedule_after_reconciliation: mint={}", mint_pubkey),
+            source: e,
+        })?;
 
         Ok(())
     }

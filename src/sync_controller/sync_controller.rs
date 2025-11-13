@@ -1,9 +1,3 @@
-use crate::database::postgresql::DatabaseConnection;
-use crate::message_queue::token_event_message_queue::Redis;
-use crate::repositories::AtomicityData;
-use crate::repositories::tracked_mints::TrackedMintsRepository;
-use crate::utils::timer::TaskLogger;
-use crate::baseline::HttpClient;
 use rust_decimal::Decimal;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -11,8 +5,14 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
+use crate::database::postgresql::DatabaseConnection;
+use crate::database::repositories::AtomicityData;
+use crate::database::repositories::tracked_mints::TrackedMintsRepository;
+use crate::utils::timer::TaskLogger;
+use crate::baseline::HttpClient;
 use crate::clickhouse::clickhouse::{ClickHouse, Event};
 use crate::kafka::KafkaMessageQueue;
+use crate::error::Result;
 
 #[derive(Clone)]
 pub struct SyncController {
@@ -40,7 +40,7 @@ impl SyncController {
     pub async fn consume_events_from_queue(
         &self,
         cancellation_token: CancellationToken,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         const BATCH_SIZE: usize = 1000;
         const BATCH_TIMEOUT_MS: u64 = 100; // Duration::from_millis 接收 u64
         let consumer_name = "token_event_dequeuer";
@@ -100,8 +100,9 @@ impl SyncController {
                                     Some((message_id.clone(), event))
                                 }
                                 Err(e) => {
+                                    // todo!: 这里其实也有问题，因为直接丢弃一个事件的话，其实很有可能导致相关代币后续所有信息更新全错
                                     // 如果解析失败，打印日志并返回 None，这条记录将被安全地丢弃
-                                    info!(
+                                    error!(
                                         "Skipping event with invalid delta. Tx: {}, Delta: '{}', Error: {}",
                                         raw_event.tx_signature, raw_event.delta, e
                                     );
@@ -168,7 +169,7 @@ impl SyncController {
                             .collect();
 
                         if synced_token_events.is_empty() { continue }
-                        
+
                         // 这俩可能需要绑定在一块
                         if let Err(e) = self.database.upsert_synced_mints_atomic(&synced_token_events, &self.clickhouse).await {
                             error!("upsert token_account, holders, mint_stats error: {}", e);
@@ -186,12 +187,12 @@ impl SyncController {
     pub async fn consume_baseline_mints_for_queue(
         &self,
         cancellation_token: CancellationToken,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         // todo!: 这里考虑是否需要全局并发数，将这些配置在.env文件中
         // todo!: 这里考虑 分离大代币和 小代币，防止大代币长时间占用线程，可以通过创建两个不同的semaphore来实现
-        const MAX_CONCURRENT_BASELINE: usize = 5; // 最大并发执行数
+        const MAX_CONCURRENT_BASELINE: usize = 4; // 最大并发执行数
         const MAX_TASKS_IN_MEMORY: usize = 10; // 内存中最多任务数
-        const DEQUEUE_SIZE: usize = 5; // 批量拉取任务数
+        const DEQUEUE_SIZE: usize = 4; // 批量拉取任务数
         const BATCH_TIMEOUT_MS: u64 = 100;
         let consumer_name = "baseline_dequeuer";
 
@@ -295,7 +296,7 @@ impl SyncController {
     }
 
     /// 处理单个 mint 的完整 baseline 流程
-    async fn process_single_baseline(&self, controller: SyncController, mint: &str) -> anyhow::Result<()> {
+    async fn process_single_baseline(&self, controller: SyncController, mint: &str) -> Result<()> {
         /// todo!: 这里要做的一件事情是先对holder_count进行判断，如果数量大于某个阈值(20万)，则视为big token，使用其他方式获取
         const BIG_TOKEN_HOLDER_COUNT: u64 = 10 * 10000;
         let onchain_holder = self.http_client.get_sol_scan_holder(mint).await?;
@@ -356,7 +357,7 @@ impl SyncController {
         Ok(())
     }
 
-    pub async fn build_baseline(&self, mint: &str) -> anyhow::Result<i64> {
+    pub async fn build_baseline(&self, mint: &str) -> Result<i64> {
         info!("start building baseline for: {}", mint);
         let token_accounts = self.http_client.get_token_holders(mint).await?;
 
@@ -375,7 +376,7 @@ impl SyncController {
     /// 从 baseline_slot 追赶到当前已有的历史事件
     /// 当 next_cursor 为 None 时表示历史数据已追完，直接退出
     /// 之后的新事件由 consume_events_from_queue 统一处理
-    pub async fn catch_up(&self, baseline_slot: i64, mint: &str) -> anyhow::Result<()> {
+    pub async fn catch_up(&self, baseline_slot: i64, mint: &str) -> Result<()> {
         const BATCH_SIZE: i64 = 1000;
         let mut cursor = (baseline_slot - 1, i64::MAX);
         let mut total_processed = 0;
@@ -449,8 +450,6 @@ impl SyncController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::postgresql::DatabaseConfig;
-    use crate::message_queue::RedisQueueConfig;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::{EnvFilter, Layer, fmt};

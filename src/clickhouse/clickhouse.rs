@@ -1,4 +1,3 @@
-use anyhow::Error;
 use chrono::{DateTime, Utc};
 use clickhouse::{Client, Row};
 use fixnum::{typenum, FixedPoint};
@@ -8,6 +7,7 @@ use tracing::info;
 use crate::clickhouse::helper::ClickhouseDecimal;
 use crate::EVENT_LOG_TARGET;
 use crate::utils::timer::TaskLogger;
+use crate::error::{ClickHouseError, Result};
 
 type Money = FixedPoint<i128, typenum::U12>;
 
@@ -67,14 +67,18 @@ impl ClickHouse {
         &self,
         events: &[Event],
         logger: &mut TaskLogger,
-    ) -> Result<(), Error> {
+    ) -> Result<()> {
         if events.is_empty() {
             return Ok(());
         }
         logger.log("start to upsert events");
 
         // 批量插入events（ReplacingMergeTree会自动处理upsert逻辑）
-        let mut insert = self.client.insert::<Event>("events").await?;
+        let mut insert = self.client.insert::<Event>("events").await
+            .map_err(|e| ClickHouseError::InsertFailed {
+                operation: "upsert_events_batch: create insert".to_string(),
+                source: e,
+            })?;
 
         for event in events {
             info!(target: EVENT_LOG_TARGET, "Upserted event sig:{:?}", event.tx_sig);
@@ -89,20 +93,32 @@ impl ClickHouse {
                 confirmed: 0,                // 新事件默认未确认
                 _timestamp: Utc::now(),      // 设置时间戳
             };
-            insert.write(&new_event).await?;
+            insert.write(&new_event).await
+                .map_err(|e| ClickHouseError::InsertFailed {
+                    operation: format!("upsert_events_batch: write event {}", event.tx_sig),
+                    source: e,
+                })?;
         }
 
-        insert.end().await?;
+        insert.end().await
+            .map_err(|e| ClickHouseError::InsertFailed {
+                operation: "upsert_events_batch: end insert".to_string(),
+                source: e,
+            })?;
         Ok(())
     }
 
-    pub async fn confirm_events(&self, events: &[Event]) -> Result<(), Error> {
+    pub async fn confirm_events(&self, events: &[Event]) -> Result<()> {
         if events.is_empty() {
             return Ok(());
         }
 
         // 批量插入新版本的events（confirmed=1, timestamp=now）
-        let mut insert = self.client.insert::<Event>("events").await?;
+        let mut insert = self.client.insert::<Event>("events").await
+            .map_err(|e| ClickHouseError::InsertFailed {
+                operation: "confirm_events: create insert".to_string(),
+                source: e,
+            })?;
 
         for event in events {
             let updated_event = Event {
@@ -115,10 +131,18 @@ impl ClickHouse {
                 confirmed: 1,                // 标记为已确认
                 _timestamp: Utc::now(),      // 更新时间戳，确保是最新版本
             };
-            insert.write(&updated_event).await?;
+            insert.write(&updated_event).await
+                .map_err(|e| ClickHouseError::InsertFailed {
+                    operation: format!("confirm_events: write event {}", event.tx_sig),
+                    source: e,
+                })?;
         }
 
-        insert.end().await?;
+        insert.end().await
+            .map_err(|e| ClickHouseError::InsertFailed {
+                operation: "confirm_events: end insert".to_string(),
+                source: e,
+            })?;
         Ok(())
     }
 
@@ -126,7 +150,7 @@ impl ClickHouse {
         &self,
         mint: &str,
         baseline_slot: i64,
-    ) -> Result<u64, Error> {
+    ) -> Result<u64> {
         // 1. 查询符合条件的events
         let query_template = "
             SELECT * FROM events
@@ -140,21 +164,41 @@ impl ClickHouse {
             .query(query_template)
             .bind(mint)                 // 绑定第一个 '?' (mint_pubkey)
             .bind(baseline_slot as u64) // 绑定第二个 '?' (slot)
-            .fetch::<Event>()?;       // 假设你有一个 Event struct
+            .fetch::<Event>()
+            .map_err(|e| ClickHouseError::QueryFailed {
+                query: format!("confirm_events_before_baseline: query mint={} slot={}", mint, baseline_slot),
+                source: e,
+            })?;
 
         let mut count = 0u64;
-        let mut insert = self.client.insert::<Event>("events").await?;
+        let mut insert = self.client.insert::<Event>("events").await
+            .map_err(|e| ClickHouseError::InsertFailed {
+                operation: "confirm_events_before_baseline: create insert".to_string(),
+                source: e,
+            })?;
 
-        while let Some(mut event) = cursor.next().await? {
+        while let Some(mut event) = cursor.next().await
+            .map_err(|e| ClickHouseError::QueryFailed {
+                query: format!("confirm_events_before_baseline: fetch next event for mint={}", mint),
+                source: e,
+            })? {
             // ... 处理 event
             event.confirmed = 1;
             event._timestamp = Utc::now();
-            insert.write(&event).await?;
+            insert.write(&event).await
+                .map_err(|e| ClickHouseError::InsertFailed {
+                    operation: format!("confirm_events_before_baseline: write event {}", event.tx_sig),
+                    source: e,
+                })?;
 
             count += 1;
         }
 
-        insert.end().await?;
+        insert.end().await
+            .map_err(|e| ClickHouseError::InsertFailed {
+                operation: "confirm_events_before_baseline: end insert".to_string(),
+                source: e,
+            })?;
 
         println!(
                 "Marked {} events before baseline (slot < {}) as confirmed for mint {}",
@@ -169,7 +213,7 @@ impl ClickHouse {
         cursor: (i64, i64),
         mint: &str,
         limit: i64,
-    ) -> Result<(Vec<Event>, Option<(i64, i64)>), Error> {
+    ) -> Result<(Vec<Event>, Option<(i64, i64)>)> {
         let (last_slot, last_timestamp) = cursor;
 
         // 构造查询：使用(slot, _timestamp)作为游标
@@ -191,7 +235,12 @@ impl ClickHouse {
         let events = self.client
             .query(&query)
             .fetch_all::<Event>()
-            .await?;
+            .await
+            .map_err(|e| ClickHouseError::QueryFailed {
+                query: format!("get_next_events_batch: mint={} cursor=({},{}) limit={}",
+                    mint, last_slot, last_timestamp, limit),
+                source: e,
+            })?;
 
         // 确定下一个游标
         let next_cursor = events.last().map(|last_event| {

@@ -1,4 +1,4 @@
-use anyhow::Error;
+use crate::error::DatabaseError;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::time::Duration;
 use tracing::info;
@@ -99,7 +99,7 @@ pub struct DatabaseConnection {
 }
 
 impl DatabaseConnection {
-    pub async fn new(config: DatabaseConfig) -> Result<Self, Error> {
+    pub async fn new(config: DatabaseConfig) -> Result<Self, DatabaseError> {
         let pool = PgPoolOptions::new()
             .max_connections(config.max_connections)
             .acquire_timeout(Duration::from_secs(config.acquire_timeout))

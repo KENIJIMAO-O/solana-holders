@@ -1,5 +1,5 @@
 use crate::monitor::utils::utils::get_grpc_client;
-use anyhow::Result;
+use crate::error::Result;
 use futures::Sink;
 use futures::channel::mpsc;
 use std::collections::HashMap;
@@ -40,7 +40,7 @@ impl GrpcClient {
         commitment: CommitmentLevel,        // commitment级别
     ) -> Result<(
         impl Sink<SubscribeRequest, Error = mpsc::SendError>,
-        impl Stream<Item = Result<SubscribeUpdate, Status>>,
+        impl Stream<Item = std::result::Result<SubscribeUpdate, Status>>,
     )> {
         // 1.构建client
         let mut client = get_grpc_client().await?;
@@ -67,7 +67,8 @@ impl GrpcClient {
         // 返回流
         let (subscribe_tx, stream) = client
             .subscribe_with_request(Some(subscribe_request))
-            .await?;
+            .await
+            .map_err(|e| crate::error::GrpcError::SubscriptionFailed(format!("Failed to subscribe: {}", e)))?;
         Ok((subscribe_tx, stream))
     }
 
@@ -77,14 +78,26 @@ impl GrpcClient {
         account_exclude: Vec<String>,  // 不包含这些地址的相关交易都会收到
         account_required: Vec<String>, // 必须要包含的地址
         commitment: CommitmentLevel,
-    ) -> Result<impl Stream<Item = Result<SubscribeUpdate, Status>>> {
+    ) -> Result<impl Stream<Item = std::result::Result<SubscribeUpdate, Status>>> {
         // client
-        let mut client = GeyserGrpcClient::build_from_shared(self.endpoint.clone())?
-            .tls_config(ClientTlsConfig::new().with_native_roots())?
+        let mut client = GeyserGrpcClient::build_from_shared(self.endpoint.clone())
+            .map_err(|e| crate::error::GrpcError::ConnectionFailed {
+                url: self.endpoint.clone(),
+                source: Box::new(e),
+            })?
+            .tls_config(ClientTlsConfig::new().with_native_roots())
+            .map_err(|e| crate::error::GrpcError::ConnectionFailed {
+                url: self.endpoint.clone(),
+                source: Box::new(e),
+            })?
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(60))
             .connect()
-            .await?;
+            .await
+            .map_err(|e| crate::error::GrpcError::ConnectionFailed {
+                url: self.endpoint.clone(),
+                source: Box::new(e),
+            })?;
 
         // 过滤规则
         let mut transactions: TransactionsFilterMap = HashMap::new();
@@ -110,22 +123,36 @@ impl GrpcClient {
         // 返回流
         let (_, stream) = client
             .subscribe_with_request(Some(subscribe_request))
-            .await?;
+            .await
+            .map_err(|e| crate::error::GrpcError::SubscriptionFailed(format!("Failed to subscribe: {}", e)))?;
 
         Ok(stream)
     }
 
     // grpc订阅最新交易哈希
     pub async fn get_latest_blockhash(&self) -> Result<String> {
-        let mut client = GeyserGrpcClient::build_from_shared(self.endpoint.clone())?
-            .tls_config(ClientTlsConfig::new().with_native_roots())?
+        let mut client = GeyserGrpcClient::build_from_shared(self.endpoint.clone())
+            .map_err(|e| crate::error::GrpcError::ConnectionFailed {
+                url: self.endpoint.clone(),
+                source: Box::new(e),
+            })?
+            .tls_config(ClientTlsConfig::new().with_native_roots())
+            .map_err(|e| crate::error::GrpcError::ConnectionFailed {
+                url: self.endpoint.clone(),
+                source: Box::new(e),
+            })?
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(60))
             .max_decoding_message_size(16 * 1024 * 1024)
             .max_encoding_message_size(16 * 1024 * 1024)
             .connect()
-            .await?;
-        let response = client.get_latest_blockhash(None).await?;
+            .await
+            .map_err(|e| crate::error::GrpcError::ConnectionFailed {
+                url: self.endpoint.clone(),
+                source: Box::new(e),
+            })?;
+        let response = client.get_latest_blockhash(None).await
+            .map_err(|e| crate::error::GrpcError::StreamError(format!("Failed to get latest blockhash: {}", e)))?;
         Ok(response.blockhash)
     }
 }

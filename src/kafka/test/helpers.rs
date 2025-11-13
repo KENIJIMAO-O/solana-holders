@@ -7,7 +7,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 use std::time::Duration;
 
-use crate::monitor::monitor::{InstructionType, TokenEvent};
+use crate::monitor::new_monitor::TokenEvent;
 
 /// 创建 Kafka topic
 pub async fn create_topic(topic_name: &str) -> anyhow::Result<()> {
@@ -110,7 +110,6 @@ pub fn create_test_token_event_with_index(index: u32) -> TokenEvent {
         account_address: account,
         owner_address: Some(account),
         delta: "1000000".to_string(),
-        instruction_type: InstructionType::Transfer(account, 0, account, 0, 1000000),
         confirmed: true,
     }
 }

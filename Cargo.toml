@@ -9,6 +9,7 @@ dotenv = "0.15.0"
 
 # 错误处理
 anyhow = "1.0.100"
+thiserror = "2.0.17"
 
 # 异步
 rayon = "1.11.0"

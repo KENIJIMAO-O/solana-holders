@@ -2,6 +2,7 @@ use crate::baseline::HttpClient;
 use crate::database::postgresql::DatabaseConnection;
 use serde::Deserialize;
 use std::sync::Arc;
+use crate::clickhouse::clickhouse::ClickHouse;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct SchedulingTier {
@@ -22,10 +23,11 @@ pub struct AppConfig {
     pub audit: Option<AuditConfig>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ReconciliationServer {
-    pub(crate) app_config: AppConfig,
+    pub app_config: AppConfig,
     pub database: Arc<DatabaseConnection>,
+    pub clickhouse: Arc<ClickHouse>,
     pub http_client: Arc<HttpClient>,
 }
 
