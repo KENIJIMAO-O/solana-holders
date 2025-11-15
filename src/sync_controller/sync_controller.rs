@@ -77,55 +77,41 @@ impl SyncController {
 
                     logger.log("batch dequeue holder events complete");
 
-                    // --- 数据清洗与转换 ---
-                    // 使用 filter_map 来安全地解析和过滤数据
-                    let (message_ids, token_events): (Vec<String>, Vec<Event>) = datas
-                        .iter()
-                        .filter_map(|(message_id, raw_event)| {
-                            // 1. 尝试将 delta 字符串解析为 Decimal
-                            match raw_event.delta.parse::<Decimal>() {
-                                Ok(delta) => {
-                                    let confirmed_u8 = if raw_event.confirmed {1u8} else {0u8};
-                                    // 2. 如果解析成功，构建 Event 对象
-                                    let event = Event::new(
-                                        raw_event.slot,
-                                        raw_event.tx_signature.clone(),
-                                        raw_event.mint_address.to_string(),
-                                        raw_event.account_address.to_string(),
-                                        raw_event.owner_address.map_or("".to_string(), |o| o.to_string()),
-                                        delta,
-                                        confirmed_u8,
-                                    );
-                                    // 3. 将有效的元组包裹在 Some 中返回，以保留此数据
-                                    Some((message_id.clone(), event))
-                                }
-                                Err(e) => {
-                                    // todo!: 这里其实也有问题，因为直接丢弃一个事件的话，其实很有可能导致相关代币后续所有信息更新全错
-                                    // 如果解析失败，打印日志并返回 None，这条记录将被安全地丢弃
-                                    error!(
-                                        "Skipping event with invalid delta. Tx: {}, Delta: '{}', Error: {}",
-                                        raw_event.tx_signature, raw_event.delta, e
-                                    );
-                                    None
-                                }
-                            }
-                        })
-                        .unzip();
+                    // --- 数据清洗、转换和聚合（单次迭代）---
+                    let capacity = datas.len();
+                    let mut _message_ids = Vec::with_capacity(capacity);
+                    let mut token_events = Vec::with_capacity(capacity);
+                    let mut unique_mints = HashSet::new();
 
-                    // 将新代币发送到 baseline 消息队列中
-                    let mints: Vec<String> = {
-                        let mut seen = HashSet::new();
-                        token_events
-                        .iter()
-                        .filter_map(|e| {
-                        if seen.insert(&e.mint_pubkey) {
-                            Some(e.mint_pubkey.clone())
-                        } else {
-                                None
+                    for (message_id, raw_event) in datas {
+                        match raw_event.delta.parse::<Decimal>() {
+                            Ok(delta) => {
+                                let confirmed_u8 = if raw_event.confirmed { 1u8 } else { 0u8 };
+                                let event = Event::new(
+                                    raw_event.slot,
+                                    raw_event.tx_signature, // move
+                                    raw_event.mint_address.to_string(),
+                                    raw_event.account_address.to_string(),
+                                    raw_event.owner_address.map_or("".to_string(), |o| o.to_string()),
+                                    delta,
+                                    confirmed_u8,
+                                );
+                                unique_mints.insert(event.mint_pubkey.clone()); // Clone for the set
+                                token_events.push(event); // Move event
+                                _message_ids.push(message_id); // Move message_id
+                            }
+                            Err(e) => {
+                                // todo!: 这里其实也有问题，因为直接丢弃一个事件的话，其实很有可能导致相关代币后续所有信息更新全错
+                                error!(
+                                    "Skipping event with invalid delta. Tx: {}, Delta: '{}', Error: {}",
+                                    raw_event.tx_signature, raw_event.delta, e
+                                );
+                            }
                         }
-                    }).collect()
-                    };
-                    let mint_len = mints.len();
+                    }
+
+                    // 从 HashSet 创建最终的 mints Vec
+                    let mints: Vec<String> = unique_mints.into_iter().collect();
 
                     let untracked_mints = self.database.is_tracked_batch(&mints).await?;
                     logger.log(&format!("untracked_mints_len:{}", untracked_mints.len()));
@@ -190,9 +176,9 @@ impl SyncController {
     ) -> Result<()> {
         // todo!: 这里考虑是否需要全局并发数，将这些配置在.env文件中
         // todo!: 这里考虑 分离大代币和 小代币，防止大代币长时间占用线程，可以通过创建两个不同的semaphore来实现
-        const MAX_CONCURRENT_BASELINE: usize = 4; // 最大并发执行数
+        const MAX_CONCURRENT_BASELINE: usize = 2; // 最大并发执行数
         const MAX_TASKS_IN_MEMORY: usize = 10; // 内存中最多任务数
-        const DEQUEUE_SIZE: usize = 4; // 批量拉取任务数
+        const DEQUEUE_SIZE: usize = 2; // 批量拉取任务数
         const BATCH_TIMEOUT_MS: u64 = 100;
         let consumer_name = "baseline_dequeuer";
 
@@ -239,7 +225,7 @@ impl SyncController {
                         MAX_TASKS_IN_MEMORY
                     );
 
-                    for (message_id, mint) in mints {
+                    for (_message_id, mint) in mints {
                         let controller = self.clone();
                         let exec_sem = execution_semaphore.clone();
                         let mem_sem = memory_semaphore.clone();
@@ -298,7 +284,7 @@ impl SyncController {
     /// 处理单个 mint 的完整 baseline 流程
     async fn process_single_baseline(&self, controller: SyncController, mint: &str) -> Result<()> {
         /// todo!: 这里要做的一件事情是先对holder_count进行判断，如果数量大于某个阈值(20万)，则视为big token，使用其他方式获取
-        const BIG_TOKEN_HOLDER_COUNT: u64 = 10 * 10000;
+        const BIG_TOKEN_HOLDER_COUNT: u64 = 10 * 3000;
         let onchain_holder = self.http_client.get_sol_scan_holder(mint).await?;
         if onchain_holder >= BIG_TOKEN_HOLDER_COUNT {
             info!("big token holder count: {}", BIG_TOKEN_HOLDER_COUNT);
@@ -364,7 +350,7 @@ impl SyncController {
         let baseline_slot = if !token_accounts.is_empty() {
             // 使用原子性方法建立 baseline，确保三张表同时成功或同时失败
             self.database
-                .establish_baseline_atomic(mint, &token_accounts)
+                .establish_baseline_atomic(mint, token_accounts)
                 .await?
         } else {
             0

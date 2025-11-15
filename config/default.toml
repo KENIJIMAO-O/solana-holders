@@ -27,3 +27,15 @@ interval_hours = 168         # a week
 enabled = true
 # 需要审计的 mint 列表（空数组表示不审计任何 mint）
 tracked_mints = []
+
+
+# =========== Kafka配置 ============
+[kafka]
+bootstrap_servers = "localhost:9092"
+token_event_topic = "token-events"
+baseline_topic = "baseline-tasks"
+token_event_consumer_group = "token-event-consumer"
+baseline_consumer_group = "baseline-consumer"
+producer_timeout_ms = "5000"
+consumer_session_timeout_ms = "6000"
+consumer_enable_auto_commit = "false"

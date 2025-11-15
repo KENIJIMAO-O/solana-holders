@@ -17,6 +17,7 @@ use std::env;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
@@ -163,7 +164,7 @@ impl NewMonitor {
                     break;
                 }
                 Err(e) => {
-                    let current_count = self
+                    let _current_count = self
                         .reconnect_config
                         .reconnect_count
                         .fetch_add(1, Ordering::SeqCst);
@@ -182,6 +183,8 @@ impl NewMonitor {
         &mut self,
         cancellation_token: CancellationToken,
     ) -> Result<()> {
+        static BLOCK_SEMAPHORE: Semaphore = Semaphore::const_new(10);
+
         let token_program = TOKEN_PROGRAM_ID.to_string();
         let token_program_2022 = TOKEN_PROGRAM_ID_2022.to_string();
         let targets = vec![token_program, token_program_2022];
@@ -243,6 +246,8 @@ impl NewMonitor {
                                         let message_queue = Arc::clone(&self.message_queue);
                                         // 这里可能要添加线程控制
                                         tokio::spawn(async move {
+                                            let _permit = BLOCK_SEMAPHORE.acquire().await.unwrap();
+
                                             let start = std::time::Instant::now();
 
                                             if let Err(e) = Self::process_block_static(sub_block, message_queue).await {

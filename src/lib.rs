@@ -9,8 +9,7 @@ use crate::monitor::new_monitor::NewMonitor;
 use crate::sync_controller::sync_controller::SyncController;
 use crate::clickhouse::clickhouse::ClickHouse;
 use crate::kafka::{KafkaMessageQueue, KafkaQueueConfig};
-use crate::error::{ConfigError, KafkaError, Result};
-use crate::reconciliation::model::ReconciliationServer;
+use crate::error::{KafkaError, Result};
 
 pub mod baseline;
 pub mod database;
@@ -98,7 +97,7 @@ impl Server {
         let sync_controller =
             SyncController::new(message_queue.clone(), database.clone(), clickhouse_client.clone(), http_client.clone());
         let sync_controller_events = {
-            let mut sync_controller = sync_controller.clone();
+            let sync_controller = sync_controller.clone();
             let token = cancellation_token.child_token();
             tokio::spawn(async move {
                 debug!("[-] Starting sync controller...");
@@ -109,7 +108,7 @@ impl Server {
             })
         };
         let sync_controller_baseline = {
-            let mut sync_controller = sync_controller.clone();
+            let sync_controller = sync_controller.clone();
             let token = cancellation_token.child_token();
             tokio::spawn(async move {
                 debug!("[-] Starting sync controller...");

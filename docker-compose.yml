@@ -66,5 +66,49 @@ services:
       retries: 3
     restart: unless-stopped
 
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ken
+      POSTGRES_PASSWORD: 123456
+      POSTGRES_DB: mydatabase
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ken -d mydatabase"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  solana_holders:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: solana_holders
+    env_file:
+      - .env
+    environment:
+      # 覆盖.env中的localhost地址为Docker服务名
+      DATABASE_URL: postgres://ken:123456@postgres/mydatabase
+      CLICKHOUSE_URL: http://clickhouse:8123
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - default
+
+networks:
+  default:
+    driver: bridge
+
 volumes:
-  redis_data:
+  postgres_data:

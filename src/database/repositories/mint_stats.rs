@@ -1,6 +1,5 @@
 use crate::database::postgresql::DatabaseConnection;
 use crate::error::{DatabaseError, Result};
-use crate::utils::timer::TaskLogger;
 use yellowstone_grpc_proto::tonic::async_trait;
 
 #[async_trait]

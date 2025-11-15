@@ -198,7 +198,7 @@ impl ReconciliationServer {
                                                         Ok(holders) => {
                                                             if !holders.is_empty() {
                                                                 match self.database
-                                                                    .establish_baseline_atomic(&schedule.mint_pubkey, &holders)
+                                                                    .establish_baseline_atomic(&schedule.mint_pubkey, holders)
                                                                     .await
                                                                 {
                                                                     Ok(baseline_slot) => {
@@ -249,7 +249,7 @@ impl ReconciliationServer {
                                                 // 更新 schedule
                                                 if let Err(e) = self.database.update_schedule_after_reconciliation(
                                                     &schedule.mint_pubkey,
-                                                    current_db_count as i64,
+                                                    current_db_count,
                                                     next_interval_hours
                                                 ).await {
                                                     error!("Failed to update schedule for mint {}: {}", schedule.mint_pubkey, e);

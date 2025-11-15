@@ -1,5 +1,5 @@
 use crate::baseline::HttpClient;
-use crate::error::{BaselineError, ConfigError, Result};
+use crate::error::{BaselineError, Result};
 use serde_json::Value;
 
 impl HttpClient {

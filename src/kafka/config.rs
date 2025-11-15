@@ -1,6 +1,6 @@
-use std::env;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaQueueConfig {
     // Kafka broker 地址
     pub bootstrap_servers: String,
@@ -39,22 +39,38 @@ impl Default for KafkaQueueConfig {
 impl KafkaQueueConfig {
     /// 从环境变量创建配置，不存在则使用默认值
     pub fn from_env() -> Self {
+        let settings = config::Config::builder()
+            .add_source(config::File::with_name("config/default"))
+            // 也可以从环境变量覆盖
+            .add_source(config::Environment::with_prefix("APP"))
+            .build()
+            .unwrap();
+
+        let res = settings.get::<KafkaQueueConfig>("kafka").unwrap();
+
         Self {
-            bootstrap_servers: env::var("KAFKA_BOOTSTRAP_SERVERS")
-                .unwrap_or_else(|_| "localhost:9092".to_string()),
-            token_event_topic: env::var("KAFKA_TOKEN_EVENT_TOPIC")
-                .unwrap_or_else(|_| "token-events".to_string()),
-            baseline_topic: env::var("KAFKA_BASELINE_TOPIC")
-                .unwrap_or_else(|_| "baseline-tasks".to_string()),
-            token_event_consumer_group: env::var("KAFKA_TOKEN_EVENT_CONSUMER_GROUP")
-                .unwrap_or_else(|_| "token-event-consumer".to_string()),
-            baseline_consumer_group: env::var("KAFKA_BASELINE_CONSUMER_GROUP")
-                .unwrap_or_else(|_| "baseline-consumer".to_string()),
-            producer_timeout_ms: env::var("KAFKA_PRODUCER_TIMEOUT_MS")
-                .unwrap_or_else(|_| "5000".to_string()),
-            consumer_session_timeout_ms: env::var("KAFKA_CONSUMER_SESSION_TIMEOUT_MS")
-                .unwrap_or_else(|_| "6000".to_string()),
-            consumer_enable_auto_commit: "false".to_string(),
+            bootstrap_servers: res.bootstrap_servers,
+            token_event_topic: res.token_event_topic,
+            baseline_topic: res.baseline_topic,
+            token_event_consumer_group: res.token_event_consumer_group,
+            baseline_consumer_group: res.baseline_consumer_group,
+            producer_timeout_ms: res.producer_timeout_ms,
+            consumer_session_timeout_ms: res.consumer_session_timeout_ms,
+            consumer_enable_auto_commit: res.consumer_enable_auto_commit,
         }
     }
+}
+
+
+#[test]
+fn test_kafka_load_config() {
+    let settings = config::Config::builder()
+        .add_source(config::File::with_name("config/default"))
+        // 也可以从环境变量覆盖
+        .add_source(config::Environment::with_prefix("APP"))
+        .build()
+        .unwrap();
+
+    let res = settings.get::<KafkaQueueConfig>("kafka").unwrap();
+    println!("res: {:#?}", res);
 }

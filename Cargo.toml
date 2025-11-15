@@ -11,6 +11,9 @@ dotenv = "0.15.0"
 anyhow = "1.0.100"
 thiserror = "2.0.17"
 
+# 内存分配器 (优化内存碎片化问题)
+tikv-jemallocator = "0.6"
+
 # 异步
 rayon = "1.11.0"
 tokio = { version = "1.45", features = ["full"] }
@@ -35,6 +38,11 @@ sqlx = { version = "0.8.6",features = ["postgres", "runtime-tokio-rustls", "macr
 chrono = "0.4"
 clickhouse = { version = "0.14.0",features = ["chrono", "native-tls"]}
 fixnum = { version = "0.9", features = ["i16", "i32", "i64", "i128", "serde"] }
+
+# web server
+axum = "0.8.4"
+tower = "0.5.2"
+tower-http = { version = "0.6.6", features = ["cors", "trace"] }
 
 # solana链上交互
 solana-client = "2.2.7"

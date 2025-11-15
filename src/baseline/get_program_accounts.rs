@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::pin::Pin;
 use std::str::FromStr;
-use tracing::info;
+use tracing::{info};
 
 #[derive(Debug, Deserialize, Serialize)] // 使用 Debug trait 方便打印调试
 pub struct TokenHolder {
@@ -51,12 +51,35 @@ impl HttpClient {
                 source: Box::new(e),
             })?;
 
+        // 检查是否有error字段
+        if let Some(error) = json_response.get("error") {
+            return Err(BaselineError::RpcCallFailed {
+                method: "getAccountInfo".to_string(),
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("RPC returned error: {}", error)
+                )),
+            }.into());
+        }
+
+        // 检查result字段是否存在
+        if json_response.get("result").is_none() {
+            return Err(BaselineError::RpcCallFailed {
+                method: "getAccountInfo".to_string(),
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("RPC response missing 'result' field. Response: {}", json_response)
+                )),
+            }.into());
+        }
+
         let get_program_accounts_result: GetAccountInfoData =
             serde_json::from_value(json_response.clone())
-                .map_err(|e| BaselineError::ParseFailed {
+                .map_err(|e|{
+                    BaselineError::ParseFailed {
                     operation: "parse getAccountInfo response".to_string(),
                     source: e,
-                })?;
+                }})?;
         let owner = get_program_accounts_result.result.value.owner.clone();
 
         let token_holders = if owner == TOKEN_PROGRAM_ID.to_string() {
@@ -483,7 +506,7 @@ mod tests {
         let rpc_url = std::env::var("RPC_URL").unwrap();
         let http_client = HttpClient::default();
 
-        let mint = "DrZ26cKJDksVRWib3DVVsjo9eeXccc7hKhDJviiYEEZY";
+        let mint = "D3thCZnicLHLnqRM2Ycom11hS648TUgWa9WX8ihCdm39";
         let res = http_client.get_token_holders(mint).await;
 
         let path = "getProgramAccounts.json";
@@ -649,5 +672,55 @@ mod tests {
         println!("👍 文件 '{}' 写入成功!", path);
         println!("总计 {} holders", count);
         println!("duration: {:?}", duration);
+    }
+
+    #[tokio::test]
+    async fn test_get_account_info() -> Result<()>{
+        dotenv::dotenv().ok();
+        let mint = "SnJNWtX6yHaEmxdR3nbyXrB3nyqXYmhsm18orScs1vu";
+
+        let rpc_url = std::env::var("RPC_URL").unwrap();
+        let http_client = HttpClient::default();
+
+        // 1.判断当前代币类型
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [
+                mint,
+                {"encoding": "base64"}
+            ]
+        });
+        let response = http_client
+            .http_client
+            .post(rpc_url)
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| BaselineError::RpcCallFailed {
+                method: "getAccountInfo".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // 解析响应
+        let json_response: serde_json::Value = response.json().await
+            .map_err(|e| BaselineError::RpcCallFailed {
+                method: "getAccountInfo response parsing".to_string(),
+                source: Box::new(e),
+            })?;
+
+        let get_program_accounts_result: GetAccountInfoData =
+            serde_json::from_value(json_response.clone())
+                .map_err(|e|{
+                    BaselineError::ParseFailed {
+                        operation: "parse getAccountInfo response".to_string(),
+                        source: e,
+                    }})?;
+        let owner = get_program_accounts_result.result.value.owner.clone();
+
+        println!("owner :{:#?}", owner);
+        Ok(())
     }
 }

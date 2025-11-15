@@ -8,7 +8,6 @@ use crate::database::postgresql::DatabaseConnection;
 use crate::database::repositories::token_accounts::aggregate_token_account_events;
 use crate::error::{DatabaseError, Result};
 
-pub mod audit;
 pub mod holders;
 pub mod mint_stats;
 pub mod reconciliation_schedule;
@@ -17,7 +16,7 @@ pub mod tracked_mints;
 
 /// token_accounts 聚合数据结构
 #[derive(Debug, Clone)]
-pub(crate) struct TokenAccountAggregateData {
+pub struct TokenAccountAggregateData {
     pub acct_pubkey: String,
     pub mint_pubkey: String,
     pub owner_pubkey: String,
@@ -36,7 +35,7 @@ pub trait AtomicityData {
     async fn establish_baseline_atomic(
         &self,
         mint: &str,
-        token_accounts: &[TokenHolder],
+        token_accounts: Vec<TokenHolder>,
     ) -> Result<i64>;
 }
 
@@ -62,26 +61,21 @@ impl AtomicityData for DatabaseConnection {
         // 1.0 聚合 token_accounts 数据（避免同一个 account 多次更新）
         let aggregated_accounts = aggregate_token_account_events(synced_events);
 
-        let account_pubkeys: Vec<String> = aggregated_accounts
-            .iter()
-            .map(|a| a.acct_pubkey.clone())
-            .collect();
-        let mint_pubkeys: Vec<String> = aggregated_accounts
-            .iter()
-            .map(|a| a.mint_pubkey.clone())
-            .collect();
-        let owner_pubkeys: Vec<String> = aggregated_accounts
-            .iter()
-            .map(|a| a.owner_pubkey.clone())
-            .collect();
-        let balances: Vec<String> = aggregated_accounts
-            .iter()
-            .map(|a| a.delta.to_string())
-            .collect();
-        let slots: Vec<i64> = aggregated_accounts
-            .iter()
-            .map(|a| a.last_updated_slot)
-            .collect();
+        // 优化：单次迭代构建所有 Vec，避免多次遍历
+        let capacity = aggregated_accounts.len();
+        let mut account_pubkeys = Vec::with_capacity(capacity);
+        let mut mint_pubkeys = Vec::with_capacity(capacity);
+        let mut owner_pubkeys = Vec::with_capacity(capacity);
+        let mut balances = Vec::with_capacity(capacity);
+        let mut slots = Vec::with_capacity(capacity);
+
+        for account in aggregated_accounts {
+            account_pubkeys.push(account.acct_pubkey);
+            mint_pubkeys.push(account.mint_pubkey);
+            owner_pubkeys.push(account.owner_pubkey);
+            balances.push(account.delta.to_string());
+            slots.push(account.last_updated_slot);
+        }
 
         info!("start upserting token_accounts");
         // 1.1 upsert token_accounts（实时事件的 baseline_slot 为 NULL）
@@ -128,23 +122,25 @@ impl AtomicityData for DatabaseConnection {
         // 2.0 聚合 synced_events（合并同一个 (mint, owner) 的多个事件）
         let aggregate_datas = holders::aggregate_events(synced_events);
 
-        // 从聚合后的数据提取字段
-        let holder_mint_pubkeys: Vec<String> = aggregate_datas
-            .iter()
-            .map(|d| d.mint_pubkey.clone())
-            .collect();
-        let holder_owner_pubkeys: Vec<String> = aggregate_datas
-            .iter()
-            .map(|d| d.owner_pubkey.clone())
-            .collect();
-        let holder_balances: Vec<String> = aggregate_datas
-            .iter()
-            .map(|d| d.balance.to_string())
-            .collect();
-        let holder_slots: Vec<i64> = aggregate_datas
-            .iter()
-            .map(|d| d.last_updated_slot)
-            .collect();
+        // 优化：单次迭代构建所有 Vec，避免多次遍历
+        let holder_capacity = aggregate_datas.len();
+        let mut holder_mint_pubkeys = Vec::with_capacity(holder_capacity);
+        let mut holder_owner_pubkeys = Vec::with_capacity(holder_capacity);
+        let mut holder_balances = Vec::with_capacity(holder_capacity);
+        let mut holder_slots = Vec::with_capacity(holder_capacity);
+        let mut total_balances: HashMap<String, ClickhouseDecimal> = HashMap::new();
+
+        for data in aggregate_datas {
+            holder_mint_pubkeys.push(data.mint_pubkey.clone());
+            holder_owner_pubkeys.push(data.owner_pubkey);
+            holder_balances.push(data.balance.to_string());
+            holder_slots.push(data.last_updated_slot);
+            // 合并第二个循环的逻辑
+            let entry = total_balances
+                .entry(data.mint_pubkey)
+                .or_insert(ClickhouseDecimal::from_int(0));
+            *entry = *entry + data.balance;
+        }
 
         // 2.1 upsert holders
         info!("start upserting holders");
@@ -198,31 +194,44 @@ impl AtomicityData for DatabaseConnection {
                 .or_insert(event.slot as i64);
         }
 
-        // 4. 重新统计 holder_count
-        let unique_mints: HashSet<String> = synced_events
+        // 4. 批量统计 holder_count（优化：一次查询代替 N 次循环）
+        let unique_mints: Vec<String> = synced_events
             .iter()
             .map(|e| e.mint_pubkey.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
             .collect();
 
-        let mut holder_counts: Vec<(String, i64)> = Vec::new();
+        // 一次性查询所有 mint 的 holder_count
+        let holder_counts_result = sqlx::query!(
+            r#"
+            SELECT mint_pubkey, COUNT(*) as "count!"
+            FROM holders
+            WHERE mint_pubkey = ANY($1) AND balance > 0
+            GROUP BY mint_pubkey
+            "#,
+            &unique_mints,
+        )
+        .fetch_all(&mut *tx)
+        .await.map_err(|e| DatabaseError::QueryFailed {
+            query: "upsert_synced_mints_atomic: batch count holders".to_string(),
+            source: e,
+        })?;
 
-        for mint in unique_mints {
-            let count = sqlx::query_scalar!(
-                r#"
-              SELECT COUNT(*) as "count!"
-              FROM holders
-              WHERE mint_pubkey = $1 AND balance > 0
-              "#,
-                mint
-            )
-            .fetch_one(&mut *tx) // 关键：在同一事务中
-            .await.map_err(|e| DatabaseError::QueryFailed {
-                query: format!("upsert_synced_mints_atomic: count holders for mint {}", mint),
-                source: e,
-            })?;
+        // 构建 HashMap 方便查找
+        let holder_counts_map: HashMap<String, i64> = holder_counts_result
+            .into_iter()
+            .map(|row| (row.mint_pubkey, row.count))
+            .collect();
 
-            holder_counts.push((mint, count));
-        }
+        // 处理可能没有 holder 的 mint（count = 0）
+        let holder_counts: Vec<(String, i64)> = unique_mints
+            .iter()
+            .map(|mint| {
+                let count = holder_counts_map.get(mint).copied().unwrap_or(0);
+                (mint.clone(), count)
+            })
+            .collect();
 
         // 5. Upsert mint_stats（使用重新统计的值，每个 mint 使用自己的最大 slot）
         info!("start upserting mint_stats");
@@ -262,24 +271,6 @@ impl AtomicityData for DatabaseConnection {
         })?;
 
         // 6. 审计：记录 mint_stats 变化历史（如果在审计列表中）
-        let mut total_balances: HashMap<String, ClickhouseDecimal> = HashMap::new();
-        for data in &aggregate_datas {
-            let entry = total_balances
-                .entry(data.mint_pubkey.clone())
-                .or_insert(ClickhouseDecimal::from_int(0));
-            *entry = *entry + data.balance;
-        }
-
-        audit::insert_audit_records(
-            &mut tx,
-            &mint_pubkeys,
-            &holder_counts_vec,
-            &max_slots,
-            &total_balances,
-            "realtime",
-        )
-        .await?;
-
         // todo!: 因为使用的两个数据库就是不一样，所以导致现有的框架无法保证两个数据库的数据更新呈现原子性
         tx.commit().await.map_err(|e| DatabaseError::TransactionFailed(
             format!("upsert_synced_mints_atomic: commit failed: {:?}", e)
@@ -292,7 +283,7 @@ impl AtomicityData for DatabaseConnection {
     async fn establish_baseline_atomic(
         &self,
         mint: &str,
-        token_accounts: &[TokenHolder],
+        token_accounts: Vec<TokenHolder>,
     ) -> Result<i64> {
         if token_accounts.is_empty() {
             return Err(crate::error::ValidationError::EmptyData(
@@ -300,68 +291,24 @@ impl AtomicityData for DatabaseConnection {
             ).into());
         }
 
-        const CHUNK_SIZE: usize = 2000;
         let mut tx = self.pool.begin().await
             .map_err(|e| DatabaseError::TransactionFailed(
                 format!("establish_baseline_atomic: begin transaction failed: {:?}", e)
             ))?;
 
-        // 1. 插入 token_accounts（分块处理以减少内存峰值）
-        for chunk in token_accounts.chunks(CHUNK_SIZE) {
-            let mut account_pubkeys = Vec::with_capacity(chunk.len());
-            let mut mint_pubkeys = Vec::with_capacity(chunk.len());
-            let mut owner_pubkeys = Vec::with_capacity(chunk.len());
-            let mut balances = Vec::with_capacity(chunk.len());
-            let mut last_updated_slots = Vec::with_capacity(chunk.len());
+        // 1. 聚合数据并插入 holders (提前操作，因为 token_accounts 后续会被 move)
+        let aggregated_holders = holders::aggregate_token_holders(&token_accounts);
 
-            for token_holder in chunk {
-                account_pubkeys.push(token_holder.pubkey.clone());
-                mint_pubkeys.push(token_holder.mint.clone());
-                owner_pubkeys.push(token_holder.owner.clone());
-                balances.push(token_holder.balance.clone());
-                last_updated_slots.push(token_holder.slot);
-            }
+        // 优化：预分配容量，单次迭代构建所有 Vec
+        let holder_capacity = aggregated_holders.len();
+        let mut holder_mint_pubkeys = Vec::with_capacity(holder_capacity);
+        let mut holder_owner_pubkeys = Vec::with_capacity(holder_capacity);
+        let mut holder_balances = Vec::with_capacity(holder_capacity);
+        let mut holder_slots = Vec::with_capacity(holder_capacity);
 
-            sqlx::query!(
-                r#"
-                INSERT INTO token_accounts
-                    (acct_pubkey, mint_pubkey, owner_pubkey, balance, baseline_slot, last_updated_slot)
-                SELECT acct_pubkey, mint_pubkey, owner_pubkey, balance::numeric, baseline_slot, last_updated_slot
-                FROM UNNEST($1::varchar[], $2::varchar[], $3::varchar[], $4::text[], $5::bigint[], $6::bigint[])
-                    AS t(acct_pubkey, mint_pubkey, owner_pubkey, balance, baseline_slot, last_updated_slot)
-                ON CONFLICT(acct_pubkey)
-                DO UPDATE SET
-                   balance = EXCLUDED.balance,
-                   baseline_slot = EXCLUDED.baseline_slot,
-                    last_updated_slot = EXCLUDED.last_updated_slot,
-                   updated_at = now()
-                WHERE token_accounts.last_updated_slot < EXCLUDED.last_updated_slot
-                "#,
-                &account_pubkeys,
-                &mint_pubkeys,
-                &owner_pubkeys,
-                &balances,
-                &last_updated_slots,
-                &last_updated_slots,
-            )
-            .execute(&mut *tx)
-            .await.map_err(|e| DatabaseError::QueryFailed {
-                query: "establish_baseline_atomic: insert token_accounts".to_string(),
-                source: e,
-            })?;
-        }
-
-        // 2. 聚合数据并插入 holders
-        let aggregated_holders = holders::aggregate_token_holders(token_accounts);
-
-        let mut holder_mint_pubkeys = Vec::with_capacity(aggregated_holders.len());
-        let mut holder_owner_pubkeys = Vec::with_capacity(aggregated_holders.len());
-        let mut holder_balances = Vec::with_capacity(aggregated_holders.len());
-        let mut holder_slots = Vec::with_capacity(aggregated_holders.len());
-
-        for aggregated_holder in &aggregated_holders {
-            holder_mint_pubkeys.push(aggregated_holder.mint_pubkey.clone());
-            holder_owner_pubkeys.push(aggregated_holder.owner_pubkey.clone());
+        for aggregated_holder in aggregated_holders {
+            holder_mint_pubkeys.push(aggregated_holder.mint_pubkey);
+            holder_owner_pubkeys.push(aggregated_holder.owner_pubkey);
             holder_balances.push(aggregated_holder.balance.to_string());
             holder_slots.push(aggregated_holder.last_updated_slot);
         }
@@ -391,18 +338,66 @@ impl AtomicityData for DatabaseConnection {
             source: e,
         })?;
 
+        // 2. 插入 token_accounts
+        let capacity = token_accounts.len();
+        let mut account_pubkeys = Vec::with_capacity(capacity);
+        let mut mint_pubkeys = Vec::with_capacity(capacity);
+        let mut owner_pubkeys = Vec::with_capacity(capacity);
+        let mut balances = Vec::with_capacity(capacity);
+        let mut last_updated_slots = Vec::with_capacity(capacity);
+
+        // 提取 baseline_slot
+        let baseline_slot = token_accounts.first().map_or(0, |th| th.slot);
+
+        for token_holder in token_accounts {
+            account_pubkeys.push(token_holder.pubkey);
+            mint_pubkeys.push(token_holder.mint);
+            owner_pubkeys.push(token_holder.owner);
+            balances.push(token_holder.balance);
+            last_updated_slots.push(token_holder.slot);
+        }
+
+        sqlx::query!(
+            r#"
+            INSERT INTO token_accounts
+                (acct_pubkey, mint_pubkey, owner_pubkey, balance, baseline_slot, last_updated_slot)
+            SELECT acct_pubkey, mint_pubkey, owner_pubkey, balance::numeric, baseline_slot, last_updated_slot
+            FROM UNNEST($1::varchar[], $2::varchar[], $3::varchar[], $4::text[], $5::bigint[], $6::bigint[])
+                AS t(acct_pubkey, mint_pubkey, owner_pubkey, balance, baseline_slot, last_updated_slot)
+            ON CONFLICT(acct_pubkey)
+            DO UPDATE SET
+               balance = EXCLUDED.balance,
+               baseline_slot = EXCLUDED.baseline_slot,
+                last_updated_slot = EXCLUDED.last_updated_slot,
+               updated_at = now()
+            WHERE token_accounts.last_updated_slot < EXCLUDED.last_updated_slot
+            "#,
+            &account_pubkeys,
+            &mint_pubkeys,
+            &owner_pubkeys,
+            &balances,
+            &vec![baseline_slot; capacity], // Use the extracted baseline_slot
+            &last_updated_slots,
+        )
+        .execute(&mut *tx)
+        .await.map_err(|e| DatabaseError::QueryFailed {
+            query: "establish_baseline_atomic: insert token_accounts".to_string(),
+            source: e,
+        })?;
+
+
         // 3. 插入 mint_stats
         let holder_count = holder_owner_pubkeys.len() as i64;
-        let baseline_slot = token_accounts[0].slot;
 
         sqlx::query!(
             r#"
             INSERT INTO mint_stats
-                (mint_pubkey, holder_count, last_updated_slot)
-            VALUES ($1, $2, $3)
+                (mint_pubkey, holder_count, baseline_slot, last_updated_slot)
+            VALUES ($1, $2, $3, $4)
             ON CONFLICT(mint_pubkey)
             DO UPDATE SET
                holder_count = EXCLUDED.holder_count,
+                baseline_slot = EXCLUDED.baseline_slot,
                last_updated_slot = EXCLUDED.last_updated_slot,
                updated_at = now()
             WHERE mint_stats.last_updated_slot <= EXCLUDED.last_updated_slot
@@ -410,6 +405,7 @@ impl AtomicityData for DatabaseConnection {
             mint,
             holder_count,
             baseline_slot,
+            baseline_slot
         )
         .execute(&mut *tx)
         .await.map_err(|e| DatabaseError::QueryFailed {

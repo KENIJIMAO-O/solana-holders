@@ -75,14 +75,13 @@ impl KafkaMessageQueue {
             )
             .set("auto.offset.reset", "earliest")
             // --- 核心性能优化：批量拉取 ---
-            // 1. 每次 fetch 至少拉取 1MB 数据（而不是拉取单条消息）
+            // consumer向 Broker拉取消息时：1. 每次 fetch 至少拉取 1MB 数据（而不是拉取单条消息） 2. Broker 等待数据累积的最长时间
             .set("fetch.min.bytes", "1048576") // 1 MB
-            // 2. Broker 等待数据累积的最长时间（平衡延迟和吞吐）
             .set("fetch.wait.max.ms", "100") // 100ms
-            // 3. 本地缓冲区：至少保持 10000 条消息在内存中
-            .set("queued.min.messages", "10000")
-            // 4. 增加每次 poll 返回的最大字节数（默认 1MB，提升到 10MB）
-            .set("max.partition.fetch.bytes", "10485760") // 10 MB
+            // consumer fetch消息时，不必要每次都从kafka拉取，后面会有一个线程专门从kafka将消息拉到本地缓冲区(内存)，代码直接本地缓存区读取消息
+            .set("queued.min.messages", "5000")
+            // 每次 poll 返回的最大字节数（默认 1MB，提升到 10MB）
+            .set("max.partition.fetch.bytes", "2097152") // 2 MB
             .create()
             .map_err(|e| KafkaError::ConsumerCreationFailed(format!("Failed to create Kafka consumer: {}", e)))?;
 

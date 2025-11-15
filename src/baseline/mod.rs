@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use std::time::Duration;
-use crate::error::{BaselineError, ConfigError, Result};
+use crate::error::{BaselineError, Result};
 
 pub mod get_program_accounts;
 pub mod token_meta;

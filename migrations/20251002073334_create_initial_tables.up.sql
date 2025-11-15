@@ -29,6 +29,7 @@ CREATE TABLE holders (
 CREATE TABLE mint_stats (
     mint_pubkey TEXT PRIMARY KEY,
     holder_count BIGINT NOT NULL,
+    baseline_slot BIGINT,
     last_updated_slot BIGINT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -53,17 +54,3 @@ CREATE TABLE reconciliation_schedule (
     total_reconciliations INT DEFAULT 0,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
--- ===== mint_stats_audit_log: 审计日志，记录 mint_stats 每次变化 =====
-CREATE TABLE mint_stats_audit_log (
-    id BIGSERIAL PRIMARY KEY,
-    mint_pubkey VARCHAR(44) NOT NULL,
-    holder_count BIGINT NOT NULL,
-    last_updated_slot BIGINT NOT NULL,
-    total_balance NUMERIC(78, 0),
-    source VARCHAR(20),
-    recorded_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX idx_audit_mint_pubkey ON mint_stats_audit_log(mint_pubkey, recorded_at DESC);
-CREATE INDEX idx_audit_slot ON mint_stats_audit_log(last_updated_slot);

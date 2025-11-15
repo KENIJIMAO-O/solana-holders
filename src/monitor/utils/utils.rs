@@ -51,7 +51,7 @@ pub fn convert_to_encoded_tx(
 
     tx_with_meta
         .encode(UiTransactionEncoding::Base64, Some(u8::MAX), true)
-        .map_err(|e| ParseError::TransactionDecodeFailed {
+        .map_err(|_e| ParseError::TransactionDecodeFailed {
             slot: 0,  // slot 信息在这里不可用
             sig: "unknown".to_string(),
         }.into())

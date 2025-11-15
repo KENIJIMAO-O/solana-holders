@@ -66,7 +66,7 @@ pub fn aggregate_events(events: &[Event]) -> Vec<HolderUpsertData> {
     for event in events {
         let delta = event.delta;
 
-        let mut entry = aggregation_map
+        let entry = aggregation_map
             .entry((event.mint_pubkey.clone(), event.owner_pubkey.clone()))
             .or_insert((ClickhouseDecimal::from_decimal(Decimal::from(0)), 0));
         

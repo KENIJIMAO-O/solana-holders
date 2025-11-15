@@ -1,10 +1,14 @@
 /target
 .env
+.dockerignore
 .idea/
+.sqlx
 getProgramAccounts.json
 test.json
 README.md
 CLAUDE.md
+DEPLOY.md
+GEMINI.md
 log.log
 requirements.txt
 verify_slot_consistency.py
