@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::pin::Pin;
 use std::str::FromStr;
-use tracing::{info};
+use crate::app_info;
 
 #[derive(Debug, Deserialize, Serialize)] // 使用 Debug trait 方便打印调试
 pub struct TokenHolder {
@@ -73,7 +73,7 @@ impl HttpClient {
             }.into());
         }
 
-        let get_program_accounts_result: GetAccountInfoData =
+        let get_program_accounts_result: GetAccountInfoData = 
             serde_json::from_value(json_response.clone())
                 .map_err(|e|{
                     BaselineError::ParseFailed {
@@ -147,7 +147,7 @@ impl HttpClient {
                 source: Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, "响应中没有result字段")),
             })?;
 
-        let get_program_accounts_result: GetProgramAccountsData =
+        let get_program_accounts_result: GetProgramAccountsData = 
             serde_json::from_value(result.clone())
                 .map_err(|e| BaselineError::ParseFailed {
                     operation: "parse getProgramAccounts result".to_string(),
@@ -173,7 +173,7 @@ impl HttpClient {
                     Ok(true) => true,
                     Ok(false) => false,
                     Err(e) => {
-                        info!("parse balance error: {}", e);
+                        app_info!("parse balance error: {}", e);
                         false
                     }
                 }
@@ -248,7 +248,7 @@ impl HttpClient {
                 source: Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, "响应中没有result字段")),
             })?;
 
-        let get_program_accounts_result: GetProgramAccountsData =
+        let get_program_accounts_result: GetProgramAccountsData = 
             serde_json::from_value(result.clone())
                 .map_err(|e| BaselineError::ParseFailed {
                     operation: "parse getProgramAccounts (Token-2022) result".to_string(),
@@ -274,7 +274,7 @@ impl HttpClient {
                     Ok(true) => true,
                     Ok(false) => false,
                     Err(e) => {
-                        info!("parse balance error: {}", e);
+                        app_info!("parse balance error: {}", e);
                         false
                     }
                 }
@@ -412,7 +412,7 @@ impl HttpClient {
                     }
                 };
 
-                let get_program_accounts_result: GetProgramAccountsData =
+                let get_program_accounts_result: GetProgramAccountsData = 
                     match serde_json::from_value(result) {
                         Ok(r) => r,
                         Err(e) => {
@@ -439,7 +439,7 @@ impl HttpClient {
                     let should_include = match Decimal::from_str(balance_str) {
                         Ok(dec) => dec > Decimal::ZERO,
                         Err(e) => {
-                            info!("parse balance error: {}", e);
+                            app_info!("parse balance error: {}", e);
                             false
                         }
                     };
@@ -460,10 +460,10 @@ impl HttpClient {
                 }
 
                 if pagination_key.is_none() {
-                    info!("获取 'getProgramAccountsV2' 完成，总计 {} holders", total_count);
+                    app_info!("获取 'getProgramAccountsV2' 完成，总计 {} holders", total_count);
                     break;
                 } else {
-                    info!("获取到下一页的 'paginationKey'，已获取 {} holders，继续...", total_count);
+                    app_info!("获取到下一页的 'paginationKey'，已获取 {} holders，继续...", total_count);
                 }
             }
         })
@@ -601,9 +601,10 @@ mod tests {
 
         dotenv::dotenv().ok();
         let rpc_url = std::env::var("SOLANA_NODE_RPC_URL").unwrap();
+        let base_url = std::env::var("BASE_URL").unwrap();
         println!("HTTP URL: {}", rpc_url);
         let sol_scan_token = std::env::var("SOLSCAN_API_KEY").unwrap();
-        let http_client = HttpClient::new(rpc_url, sol_scan_token).unwrap();
+        let http_client = HttpClient::new(rpc_url, base_url, sol_scan_token).unwrap();
 
         // DFL1zNkaGPWm1BqAVqRjCZvHmwTFrEaJtbzJWgseoNJh EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
         let mint = "4Cnk9EPnW5ixfLZatCPJjDB1PUtcRpVVgTQukm9epump"; // usdc
@@ -675,7 +676,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_account_info() -> Result<()>{
+    async fn test_get_account_info() -> Result<()>{ 
         dotenv::dotenv().ok();
         let mint = "SnJNWtX6yHaEmxdR3nbyXrB3nyqXYmhsm18orScs1vu";
 
@@ -711,7 +712,7 @@ mod tests {
                 source: Box::new(e),
             })?;
 
-        let get_program_accounts_result: GetAccountInfoData =
+        let get_program_accounts_result: GetAccountInfoData = 
             serde_json::from_value(json_response.clone())
                 .map_err(|e|{
                     BaselineError::ParseFailed {

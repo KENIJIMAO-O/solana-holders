@@ -1,7 +1,7 @@
 use crate::error::DatabaseError;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::time::Duration;
-use tracing::info;
+use crate::app_info;
 
 #[derive(Clone, Debug)]
 pub struct DatabaseConfig {
@@ -70,7 +70,7 @@ impl DatabaseConfig {
                 .max(30) // 最小连接数
                 .min(300); // 最大连接数，避免过度占用数据库资源
 
-            info!(
+            app_info!(
                 "Auto-calculated max_connections: {} (based on storage_tasks: {}, heavy_rpc: {}, overhead: {})",
                 calculated, storage_tasks, heavy_rpc_limit, SYSTEM_OVERHEAD_CONNECTIONS
             );
@@ -109,7 +109,7 @@ impl DatabaseConnection {
             .connect(&config.database_url)
             .await?;
 
-        info!("Database pool initialized successfully with sqlx.");
+        app_info!("Database pool initialized successfully with sqlx.");
 
         Ok(Self { pool })
     }

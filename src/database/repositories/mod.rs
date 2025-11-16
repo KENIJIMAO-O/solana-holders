@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use tracing::info;
 use yellowstone_grpc_proto::tonic::async_trait;
 use crate::baseline::get_program_accounts::TokenHolder;
 use crate::clickhouse::clickhouse::{ClickHouse, Event};
@@ -7,6 +6,7 @@ use crate::clickhouse::helper::ClickhouseDecimal;
 use crate::database::postgresql::DatabaseConnection;
 use crate::database::repositories::token_accounts::aggregate_token_account_events;
 use crate::error::{DatabaseError, Result};
+use crate::{app_info, app_debug};
 
 pub mod holders;
 pub mod mint_stats;
@@ -52,7 +52,7 @@ impl AtomicityData for DatabaseConnection {
             return Ok(());
         }
 
-        info!("start upserting synced mints atomic");
+        app_info!("start upserting synced mints atomic");
         let mut tx = self.pool.begin().await
             .map_err(|e| DatabaseError::TransactionFailed(
                 format!("upsert_synced_mints_atomic: {:?}", e)
@@ -77,7 +77,7 @@ impl AtomicityData for DatabaseConnection {
             slots.push(account.last_updated_slot);
         }
 
-        info!("start upserting token_accounts");
+        app_info!("start upserting token_accounts");
         // 1.1 upsert token_accounts（实时事件的 baseline_slot 为 NULL）
         sqlx::query!(
             r#"
@@ -143,7 +143,7 @@ impl AtomicityData for DatabaseConnection {
         }
 
         // 2.1 upsert holders
-        info!("start upserting holders");
+        app_info!("start upserting holders");
         sqlx::query!(
             r#"
             INSERT INTO holders
@@ -170,7 +170,7 @@ impl AtomicityData for DatabaseConnection {
         })?;
 
         // 2.2 删除 balance 为 0 的数据
-        info!("start deleting holder in holders who's balance equals 0");
+        app_info!("start deleting holder in holders who's balance equals 0");
         sqlx::query!(
             r#"
         DELETE FROM holders
@@ -234,7 +234,7 @@ impl AtomicityData for DatabaseConnection {
             .collect();
 
         // 5. Upsert mint_stats（使用重新统计的值，每个 mint 使用自己的最大 slot）
-        info!("start upserting mint_stats");
+        app_info!("start upserting mint_stats");
 
         let mut mint_pubkeys = Vec::new();
         let mut holder_counts_vec = Vec::new();
@@ -422,7 +422,7 @@ impl AtomicityData for DatabaseConnection {
 #[cfg(test)]
 mod test {
     use super::*;
-    use tracing::{Level, debug, event, span};
+    use tracing::{Level, event, span};
     use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
     #[test]
@@ -433,7 +433,7 @@ mod test {
         let enter = span.enter();
         println!("wuxizhizhenshuai1");
         event!(Level::DEBUG, "something happened inside my_span");
-        info!("something happened inside my_span");
-        debug!("Alex wu");
+        app_info!("something happened inside my_span");
+        app_debug!("Alex wu");
     }
 }

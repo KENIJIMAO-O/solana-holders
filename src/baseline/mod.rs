@@ -8,12 +8,13 @@ pub mod token_meta;
 #[derive(Clone, Debug)]
 pub struct HttpClient {
     rpc_url: String,
+    base_url: String,
     sol_scan_token: String,
     http_client: reqwest::Client,
 }
 
 impl HttpClient {
-    pub fn new(rpc_url: String, sol_scan_token: String) -> Result<Self> {
+    pub fn new(rpc_url: String, base_url: String, sol_scan_token: String) -> Result<Self> {
         let http_client = reqwest::Client::builder()
             .pool_max_idle_per_host(20)
             .pool_idle_timeout(Duration::from_secs(60))
@@ -26,6 +27,7 @@ impl HttpClient {
             ))?;
         Ok(Self {
             rpc_url,
+            base_url,
             sol_scan_token,
             http_client,
         })
@@ -36,6 +38,8 @@ impl Default for HttpClient {
     fn default() -> Self {
         let rpc_url = std::env::var("RPC_URL")
             .expect("RPC_URL environment variable must be set");
+        let base_url = std::env::var("BASE_URL")
+            .expect("BASE_URL environment variable must be set");
         let sol_scan_token = std::env::var("SOLSCAN_API_KEY")
             .expect("SOLSCAN_API_KEY environment variable must be set");
         let http_client = reqwest::Client::builder()
@@ -48,6 +52,7 @@ impl Default for HttpClient {
             .expect("Failed to create HTTP client");
         Self {
             rpc_url,
+            base_url,
             sol_scan_token,
             http_client,
         }

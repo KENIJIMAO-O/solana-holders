@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use crate::{app_error, app_info, app_warn};
 use crate::baseline::HttpClient;
 use crate::clickhouse::clickhouse::ClickHouse;
 use crate::database::postgresql::DatabaseConnection;
@@ -65,7 +65,7 @@ impl ReconciliationServer {
         loop {
             tokio::select! {
                 _ = cancellation_token.cancelled() => {
-                    info!("reconciliation server received cancellation signal. Shutting down...");
+                    app_info!("reconciliation server received cancellation signal. Shutting down...");
                     break;
                 }
                 data = self.database.get_due_mints() => {
@@ -77,7 +77,7 @@ impl ReconciliationServer {
                                 continue;
                             }
 
-                            info!("Found {} mints due for reconciliation", due_mints.len());
+                            app_info!("Found {} mints due for reconciliation", due_mints.len());
 
                             // 提取所有 mint_pubkeys
                             let mint_pubkeys: Vec<String> = due_mints
@@ -89,7 +89,7 @@ impl ReconciliationServer {
                             let db_holder_counts = match self.database.get_holder_counts_batch(&mint_pubkeys).await {
                                 Ok(counts) => counts,
                                 Err(e) => {
-                                    error!("Failed to get holder counts from database: {}", e);
+                                    app_error!("Failed to get holder counts from database: {}", e);
                                     continue;
                                 }
                             };
@@ -104,7 +104,7 @@ impl ReconciliationServer {
                                 let permit = match semaphore.clone().acquire_owned().await {
                                     Ok(p) => p,
                                     Err(e) => {
-                                        error!("Failed to acquire semaphore: {}", e);
+                                        app_error!("Failed to acquire semaphore: {}", e);
                                         continue;
                                     }
                                 };
@@ -128,7 +128,7 @@ impl ReconciliationServer {
                             }
 
                             // 等待所有任务完成
-                            info!("Waiting for all reconciliation tasks to complete");
+                            app_info!("Waiting for all reconciliation tasks to complete");
                             let results = futures::future::join_all(handles).await;
 
                             // 处理结果
@@ -159,7 +159,7 @@ impl ReconciliationServer {
                                                 let needs_rebuild = if current_db_count == 0 {
                                                     // 数据库为空但链上有 holder，需要重建
                                                     if holders_count > 0 {
-                                                        warn!(
+                                                        app_warn!(
                                                             "Token:{} has {} holders onchain but 0 in db, needs rebuild",
                                                             &schedule.mint_pubkey,
                                                             holders_count
@@ -173,7 +173,7 @@ impl ReconciliationServer {
                                                     // 正常计算差异百分比
                                                     let difference_percentage = difference * 100 / current_db_count;
                                                     if difference_percentage > MAX_DIFFERENCE as i64 {
-                                                        error!(
+                                                        app_error!(
                                                             "Token:{} count in db {} is not same as onchain count {}, difference: {}%",
                                                             &schedule.mint_pubkey,
                                                             current_db_count,
@@ -188,7 +188,7 @@ impl ReconciliationServer {
 
                                                 // 如果需要重建，执行重建流程
                                                 if needs_rebuild {
-                                                    info!(
+                                                    app_info!(
                                                         "Starting rebuild for mint {} due to significant difference",
                                                         &schedule.mint_pubkey
                                                     );
@@ -202,40 +202,40 @@ impl ReconciliationServer {
                                                                     .await
                                                                 {
                                                                     Ok(baseline_slot) => {
-                                                                        info!(
+                                                                        app_info!(
                                                                             "Rebuilt baseline for mint {} at slot {}",
                                                                             &schedule.mint_pubkey, baseline_slot
                                                                         );
 
                                                                         // 执行 catch-up
                                                                         if let Err(e) = self.catch_up(baseline_slot, &schedule.mint_pubkey).await {
-                                                                            error!(
+                                                                            app_error!(
                                                                                 "Failed to catch up for mint {} after rebuild: {}",
                                                                                 &schedule.mint_pubkey, e
                                                                             );
                                                                         } else {
-                                                                            info!(
+                                                                            app_info!(
                                                                                 "✅ Successfully rebuilt and caught up for mint {}",
                                                                                 &schedule.mint_pubkey
                                                                             );
                                                                         }
                                                                     }
                                                                     Err(e) => {
-                                                                        error!(
+                                                                        app_error!(
                                                                             "Failed to establish baseline for mint {}: {}",
                                                                             &schedule.mint_pubkey, e
                                                                         );
                                                                     }
                                                                 }
                                                             } else {
-                                                                warn!(
+                                                                app_warn!(
                                                                     "Got empty holders list for mint {}, skipping rebuild",
                                                                     &schedule.mint_pubkey
                                                                 );
                                                             }
                                                         }
                                                         Err(e) => {
-                                                            error!(
+                                                            app_error!(
                                                                 "Failed to get token holders for rebuild of mint {}: {}",
                                                                 &schedule.mint_pubkey, e
                                                             );
@@ -252,9 +252,9 @@ impl ReconciliationServer {
                                                     current_db_count,
                                                     next_interval_hours
                                                 ).await {
-                                                    error!("Failed to update schedule for mint {}: {}", schedule.mint_pubkey, e);
+                                                    app_error!("Failed to update schedule for mint {}: {}", schedule.mint_pubkey, e);
                                                 } else {
-                                                    info!(
+                                                    app_info!(
                                                         "✅ Reconciliation completed for mint {}: onchain={}, db={}, next_interval={}h",
                                                         schedule.mint_pubkey, holders_count, current_db_count, next_interval_hours
                                                     );
@@ -262,7 +262,7 @@ impl ReconciliationServer {
                                             }
                                             Err(e) => {
                                                 // RPC 调用失败，仍然更新 schedule（基于数据库变化）
-                                                warn!("Failed to get onchain data for mint {}: {}", schedule.mint_pubkey, e);
+                                                app_warn!("Failed to get onchain data for mint {}: {}", schedule.mint_pubkey, e);
 
                                                 let change_percentage = if schedule.last_holder_count > 0 {
                                                     (current_db_count - schedule.last_holder_count).abs() as f64
@@ -278,19 +278,19 @@ impl ReconciliationServer {
                                                     current_db_count,
                                                     next_interval_hours
                                                 ).await {
-                                                    error!("Failed to update schedule for mint {}: {}", schedule.mint_pubkey, e);
+                                                    app_error!("Failed to update schedule for mint {}: {}", schedule.mint_pubkey, e);
                                                 }
                                             }
                                         }
                                     }
                                     Err(e) => {
-                                        error!("Task panicked: {}", e);
+                                        app_error!("Task panicked: {}", e);
                                     }
                                 }
                             }
                         }
                         Err(err) => {
-                            error!("Failed to get due mints: {:?}", err);
+                            app_error!("Failed to get due mints: {:?}", err);
                             // 不直接返回错误，而是等待后重试
                             tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
                         }
@@ -318,7 +318,7 @@ impl ReconciliationServer {
         let mut cursor = (baseline_slot - 1, i64::MAX);
         let mut total_processed = 0;
 
-        info!(
+        app_info!(
             "Starting catch-up for mint {} from slot {}",
             mint, baseline_slot
         );
@@ -330,7 +330,7 @@ impl ReconciliationServer {
             .confirm_events_before_baseline(mint, baseline_slot)
             .await?;
         if skipped_count > 0 {
-            info!(
+            app_info!(
                 "Skipped {} events before baseline_slot {} for mint {}",
                 skipped_count, baseline_slot, mint
             );
@@ -349,7 +349,7 @@ impl ReconciliationServer {
                         continue;
                     }
 
-                    info!("In next_cursor to sync mint atomic");
+                    app_info!("In next_cursor to sync mint atomic");
                     self.database
                         .upsert_synced_mints_atomic(&token_events, &self.clickhouse)
                         .await?;
@@ -359,7 +359,7 @@ impl ReconciliationServer {
                 }
                 Ok((token_events, None)) => {
                     // 没有更多历史数据，处理最后一批后退出
-                    info!("In none to sync mint atomic");
+                    app_info!("In none to sync mint atomic");
                     if !token_events.is_empty() {
                         self.database
                             .upsert_synced_mints_atomic(&token_events, &self.clickhouse)
@@ -367,14 +367,14 @@ impl ReconciliationServer {
                         total_processed += token_events.len();
                     }
 
-                    info!(
+                    app_info!(
                         "Catch-up completed for mint {}: processed {} events",
                         mint, total_processed
                     );
                     break;
                 }
                 Err(e) => {
-                    error!("Failed to get events batch for mint {}: {}", mint, e);
+                    app_error!("Failed to get events batch for mint {}: {}", mint, e);
                     return Err(e);
                 }
             }
@@ -397,7 +397,7 @@ impl ReconciliationServer {
         const MAX_CONCURRENT: usize = 10;
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
 
-        info!(
+        app_info!(
             "Starting manual reconciliation for {} mints",
             mint_pubkeys.len()
         );
@@ -418,7 +418,7 @@ impl ReconciliationServer {
             let permit = match semaphore.clone().acquire_owned().await {
                 Ok(p) => p,
                 Err(e) => {
-                    error!("Failed to acquire semaphore: {}", e);
+                    app_error!("Failed to acquire semaphore: {}", e);
                     continue;
                 }
             };
@@ -463,13 +463,13 @@ impl ReconciliationServer {
                             error_message: None,
                         });
 
-                        info!(
+                        app_info!(
                             "✅ Manual reconciliation for {}: onchain={}, db={}, diff={}",
                             mint_pubkey, onchain_count, db_count, difference
                         );
                     }
                     Err(e) => {
-                        warn!("Failed to get onchain data for mint {}: {}", mint_pubkey, e);
+                        app_warn!("Failed to get onchain data for mint {}: {}", mint_pubkey, e);
 
                         reconciliation_results.push(ManualReconciliationResult {
                             mint_pubkey: mint_pubkey.clone(),
@@ -483,12 +483,12 @@ impl ReconciliationServer {
                     }
                 },
                 Err(e) => {
-                    error!("Task panicked during manual reconciliation: {}", e);
+                    app_error!("Task panicked during manual reconciliation: {}", e);
                 }
             }
         }
 
-        info!(
+        app_info!(
             "Manual reconciliation completed: {}/{} successful",
             reconciliation_results.iter().filter(|r| r.success).count(),
             reconciliation_results.len()

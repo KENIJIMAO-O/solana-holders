@@ -4,8 +4,7 @@ use serde_json::Value;
 
 impl HttpClient {
     pub async fn get_sol_scan_holder(&self, mint: &str) -> Result<u64> {
-        let base_url = std::env::var("BASE_URL")
-            .expect("BASE_URL environment variable must be set");
+        let base_url = &self.base_url;
         let url = format!("{}{}", base_url, mint);
 
         let response_text = self.get_token_meta(&url).await?;

@@ -1,6 +1,5 @@
 use crate::kafka::config::KafkaQueueConfig;
-use crate::monitor::new_monitor::TokenEvent;
-use crate::utils::timer::TaskLogger;
+use crate::monitor::monitor::TokenEvent;
 use crate::error::{KafkaError, Result, ValidationError};
 use futures::future;
 use rdkafka::config::ClientConfig;
@@ -12,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use crate::{app_info, app_warn};
 
 /// Kafka 消息队列核心结构
 #[derive(Clone)]
@@ -34,7 +33,7 @@ impl KafkaMessageQueue {
             .create()
             .map_err(|e| KafkaError::ProducerCreationFailed(format!("Failed to create Kafka producer: {}", e)))?;
 
-        info!(
+        app_info!(
             "✅ [KAFKA] Producer created successfully, bootstrap servers: {}",
             config.bootstrap_servers
         );
@@ -100,7 +99,7 @@ impl KafkaMessageQueue {
             .subscribe(&[topic])
             .map_err(|e| KafkaError::ReceiveFailed(format!("Failed to subscribe to topic {}: {}", topic, e)))?;
 
-        info!(
+        app_info!(
             "✅ [KAFKA] Consumer '{}' created and subscribed to topic '{}'",
             consumer_name, topic
         );
@@ -117,13 +116,12 @@ impl KafkaMessageQueue {
     pub async fn batch_enqueue_holder_event(
         &self,
         token_events: Vec<TokenEvent>,
-        logger: &mut TaskLogger,
     ) -> Result<Vec<String>> {
         if token_events.is_empty() {
             return Err(ValidationError::EmptyData("token events".to_string()).into());
         }
 
-        logger.log("start to batch sending messages to kafka");
+        app_info!("start to batch sending messages to kafka");
 
         let mut payloads = Vec::with_capacity(token_events.len());
         let mut keys = Vec::with_capacity(token_events.len());
@@ -163,7 +161,7 @@ impl KafkaMessageQueue {
                     msg_ids.push(msg_id);
                 }
                 Err((e, _)) => {
-                    warn!("Failed to send message #{} to Kafka: {}", idx, e);
+                    app_warn!("Failed to send message #{} to Kafka: {}", idx, e);
                     return Err(KafkaError::SendFailed {
                         topic: self.config.token_event_topic.clone(),
                         reason: format!("Failed to send message #{}: {}", idx, e),
@@ -172,10 +170,10 @@ impl KafkaMessageQueue {
             }
         }
 
-        logger.log(&format!(
+        app_info!(
             "successfully sent {} messages to kafka",
             msg_ids.len()
-        ));
+        );
         Ok(msg_ids)
     }
 
@@ -186,10 +184,7 @@ impl KafkaMessageQueue {
         consumer_name: &str,
         max_count: usize,
         block_ms: usize,
-        logger: &mut TaskLogger,
     ) -> Result<Vec<(String, TokenEvent)>> {
-        logger.log("start to getting or creating consumer");
-
         // 获取或创建 consumer
         let consumer = self
             .get_or_create_consumer(
@@ -198,8 +193,6 @@ impl KafkaMessageQueue {
                 &self.config.token_event_consumer_group,
             )
             .await?;
-
-        logger.log("start to batch reading messages");
 
         let mut events = Vec::new();
         let timeout = Duration::from_millis(block_ms as u64);
@@ -228,7 +221,7 @@ impl KafkaMessageQueue {
                             events.push((msg_id, event));
                         }
                         Err(e) => {
-                            warn!(
+                            app_warn!(
                                 "Failed to deserialize TokenEvent from partition {} offset {}: {}",
                                 msg.partition(),
                                 msg.offset(),
@@ -241,7 +234,7 @@ impl KafkaMessageQueue {
                     }
                 }
                 Ok(Err(e)) => {
-                    warn!("Kafka consumer error: {}", e);
+                    app_warn!("Kafka consumer error: {}", e);
                     return Err(KafkaError::ReceiveFailed(format!("Kafka consumer error: {}", e)).into());
                 }
                 Err(_) => {
@@ -251,10 +244,6 @@ impl KafkaMessageQueue {
             }
         }
 
-        logger.log(&format!(
-            "successfully received {} messages from kafka",
-            events.len()
-        ));
         Ok(events)
     }
 
@@ -270,12 +259,12 @@ impl KafkaMessageQueue {
         if let Some(consumer) = consumers.get(consumer_name) {
             consumer.commit_consumer_state(CommitMode::Async)
                 .map_err(|e| {
-                    warn!("Failed to commit consumer '{}' state: {}", consumer_name, e);
+                    app_warn!("Failed to commit consumer '{}' state: {}", consumer_name, e);
                     KafkaError::ReceiveFailed(format!("Failed to commit consumer state: {}", e))
                 })?;
             Ok(())
         } else {
-            warn!("Attempted to ack non-existent consumer: {}", consumer_name);
+            app_warn!("Attempted to ack non-existent consumer: {}", consumer_name);
             // 这是一个逻辑错误，但可能不是致命的，取决于你的业务
             Ok(())
         }
@@ -322,7 +311,7 @@ impl KafkaMessageQueue {
         // 检查是否有失败的发送
         for (idx, result) in results.into_iter().enumerate() {
             if let Err((e, _)) = result {
-                warn!("Failed to send baseline task #{} to Kafka: {}", idx, e);
+                app_warn!("Failed to send baseline task #{} to Kafka: {}", idx, e);
                 return Err(KafkaError::SendFailed {
                     topic: self.config.baseline_topic.clone(),
                     reason: format!("Failed to send baseline task #{}: {}", idx, e),
@@ -330,7 +319,7 @@ impl KafkaMessageQueue {
             }
         }
 
-        info!("✅ Successfully sent {} baseline tasks to Kafka", mints.len());
+        app_info!("✅ Successfully sent {} baseline tasks to Kafka", mints.len());
         Ok(())
     }
 
@@ -380,20 +369,20 @@ impl KafkaMessageQueue {
                                 let msg_id = format!("{}:{}", msg.partition(), msg.offset());
                                 baseline_tasks.push((msg_id, mint_str.to_string()));
                             } else {
-                                warn!("Message missing 'mint_pubkey' field, skipping");
+                                app_warn!("Message missing 'mint_pubkey' field, skipping");
                                 consumer.commit_message(&msg, CommitMode::Async)
                                     .map_err(|e| KafkaError::ReceiveFailed(format!("Failed to commit message: {}", e)))?;
                             }
                         }
                         Err(e) => {
-                            warn!("Failed to parse baseline task JSON: {}", e);
+                            app_warn!("Failed to parse baseline task JSON: {}", e);
                             consumer.commit_message(&msg, CommitMode::Async)
                                 .map_err(|e| KafkaError::ReceiveFailed(format!("Failed to commit message: {}", e)))?;
                         }
                     }
                 }
                 Ok(Err(e)) => {
-                    warn!("Kafka consumer error: {}", e);
+                    app_warn!("Kafka consumer error: {}", e);
                     return Err(KafkaError::ReceiveFailed(format!("Kafka consumer error: {}", e)).into());
                 }
                 Err(_) => {
@@ -405,7 +394,7 @@ impl KafkaMessageQueue {
 
         let elapsed = start.elapsed();
         if !baseline_tasks.is_empty() {
-            info!(
+            app_info!(
                 "✅ Consumed {} baseline tasks from Kafka in {:?}",
                 baseline_tasks.len(),
                 elapsed
@@ -422,12 +411,12 @@ impl KafkaMessageQueue {
         if let Some(consumer) = consumers.get(consumer_name) {
             consumer.commit_consumer_state(CommitMode::Async)
                 .map_err(|e| {
-                    warn!("Failed to commit baseline consumer '{}' state: {}", consumer_name, e);
+                    app_warn!("Failed to commit baseline consumer '{}' state: {}", consumer_name, e);
                     KafkaError::ReceiveFailed(format!("Failed to commit consumer state: {}", e))
                 })?;
             Ok(())
         } else {
-            warn!("Attempted to ack non-existent consumer: {}", consumer_name);
+            app_warn!("Attempted to ack non-existent consumer: {}", consumer_name);
             Ok(())
         }
     }

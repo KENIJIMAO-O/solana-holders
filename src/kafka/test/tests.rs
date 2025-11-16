@@ -1,9 +1,8 @@
 use super::helpers::*;
 use crate::kafka::{KafkaMessageQueue, KafkaQueueConfig};
-use crate::utils::timer::TaskLogger;
 use rdkafka::consumer::{CommitMode, Consumer};
 use std::time::{Duration, Instant};
-
+use crate::utils::task_logger::TaskLogger;
 // ==================== Test 1: TokenEvent 基础流程 ====================
 
 /// Test 1.1: 创建 TokenEvent topic
@@ -65,7 +64,7 @@ async fn test_01_2_batch_enqueue_holder_event() {
 
     // 测试 batch_enqueue_holder_event
     let msg_ids = kafka_queue
-        .batch_enqueue_holder_event(token_events.clone(), &mut logger)
+        .batch_enqueue_holder_event(token_events.clone())
         .await
         .unwrap();
 
@@ -101,12 +100,11 @@ async fn test_01_3_batch_dequeue_holder_event() {
     };
 
     let kafka_queue = KafkaMessageQueue::new(config).unwrap();
-    let mut logger = TaskLogger::new("test", "1");
 
     // 测试 batch_dequeue_holder_event
     let consumer_name = "test-consumer-1";
     let received = kafka_queue
-        .batch_dequeue_holder_event(consumer_name, 10, 5000, &mut logger)
+        .batch_dequeue_holder_event(consumer_name, 10, 5000)
         .await
         .unwrap();
 
@@ -149,7 +147,7 @@ async fn test_01_4_ack_messages() {
     let mut logger = TaskLogger::new("test", "1");
     let consumer_name_1 = "token-consumer-1";
     let received = kafka_queue_1
-        .batch_dequeue_holder_event(consumer_name_1, 20, 5000, &mut logger)
+        .batch_dequeue_holder_event(consumer_name_1, 20, 5000)
         .await
         .unwrap();
 
@@ -185,7 +183,7 @@ async fn test_01_4_ack_messages() {
     let kafka_queue_2 = KafkaMessageQueue::new(config_2).unwrap();
     let consumer_name_2 = "token-consumer-2";
     let received_again = kafka_queue_2
-        .batch_dequeue_holder_event(consumer_name_2, 20, 5000, &mut logger)
+        .batch_dequeue_holder_event(consumer_name_2, 20, 5000)
         .await
         .unwrap();
 
@@ -223,7 +221,7 @@ async fn test_01_4_ack_messages() {
     let kafka_queue_3 = KafkaMessageQueue::new(config_3).unwrap();
     let consumer_name_3 = "token-consumer-3";
     let empty = kafka_queue_3
-        .batch_dequeue_holder_event(consumer_name_3, 20, 5000, &mut logger)
+        .batch_dequeue_holder_event(consumer_name_3, 20, 5000)
         .await
         .unwrap();
 
@@ -507,7 +505,7 @@ async fn test_03_token_event_full_workflow() {
     ];
 
     let msg_ids = kafka_queue
-        .batch_enqueue_holder_event(token_events.clone(), &mut logger)
+        .batch_enqueue_holder_event(token_events.clone())
         .await
         .unwrap();
 
@@ -517,7 +515,7 @@ async fn test_03_token_event_full_workflow() {
     // Step 2: 消费消息
     let consumer_name = "e2e-consumer";
     let received = kafka_queue
-        .batch_dequeue_holder_event(consumer_name, 10, 5000, &mut logger)
+        .batch_dequeue_holder_event(consumer_name, 10, 5000)
         .await
         .unwrap();
 
@@ -540,7 +538,7 @@ async fn test_03_token_event_full_workflow() {
 
     // Step 5: 验证 ACK 后无新消息
     let empty = kafka_queue
-        .batch_dequeue_holder_event(consumer_name, 10, 1000, &mut logger)
+        .batch_dequeue_holder_event(consumer_name, 10, 1000)
         .await
         .unwrap();
 

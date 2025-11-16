@@ -7,7 +7,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 use std::time::Duration;
 
-use crate::monitor::new_monitor::TokenEvent;
+use crate::monitor::monitor::TokenEvent;
 
 /// 创建 Kafka topic
 pub async fn create_topic(topic_name: &str) -> anyhow::Result<()> {

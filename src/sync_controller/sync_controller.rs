@@ -4,13 +4,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
 use crate::database::postgresql::DatabaseConnection;
 use crate::database::repositories::AtomicityData;
 use crate::database::repositories::tracked_mints::TrackedMintsRepository;
-use crate::utils::timer::TaskLogger;
 use crate::baseline::HttpClient;
-use crate::BIG_TOKEN_HOLDER_COUNT;
+use crate::{app_error, app_info, BIG_TOKEN_HOLDER_COUNT};
 use crate::clickhouse::clickhouse::{ClickHouse, Event};
 use crate::database::repositories::mint_stats::MintStatsRepository;
 use crate::kafka::KafkaMessageQueue;
@@ -43,29 +41,56 @@ impl SyncController {
         &self,
         cancellation_token: CancellationToken,
     ) -> Result<()> {
-        const BATCH_SIZE: usize = 1000;
-        const BATCH_TIMEOUT_MS: u64 = 100; // Duration::from_millis 接收 u64
+        // 从环境变量读取配置，提供默认值
+        let batch_size = std::env::var("TOKEN_EVENT_BATCH_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1000);
+
+        let batch_timeout_ms = std::env::var("TOKEN_EVENT_BATCH_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+
+        let max_consecutive_failures = std::env::var("TOKEN_EVENT_MAX_FAILURES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+
         let consumer_name = "token_event_dequeuer";
 
-        loop {
-            let mut logger = TaskLogger::new("sync_controller_events", "2");
+        app_info!(
+            "🔧 Token Event Consumer 配置: batch_size={}, timeout={}ms, max_failures={}",
+            batch_size, batch_timeout_ms, max_consecutive_failures
+        );
 
-            tokio::select! {
+        'retry_loop: loop {
+            let mut consecutive_failures = 0;
+
+            loop{
+                tokio::select! {
                 _ = cancellation_token.cancelled() => {
-                    info!("Monitor received cancellation signal. Shutting down...");
-                    break;
+                    app_info!("Monitor received cancellation signal. Shutting down...");
+                    break 'retry_loop;
                 }
 
                 datas_result = self.kafka_queue.batch_dequeue_holder_event(
                     consumer_name,
-                    BATCH_SIZE,
-                    BATCH_TIMEOUT_MS as usize,
-                    &mut logger,
+                    batch_size,
+                    batch_timeout_ms as usize,
                 ) => {
                     let datas = match datas_result {
-                        Ok(d) => d,
+                        Ok(d) => {
+                            consecutive_failures = 0;
+                            d
+                        },
                         Err(e) => {
-                            error!("Failed to dequeue from Redis: {}", e);
+                            consecutive_failures += 1;
+                            if consecutive_failures >= max_consecutive_failures {
+                                app_error!("Failed to dequeue {} times in a row. Restarting consumer.", max_consecutive_failures);
+                                break;
+                            }
+                            app_error!("Failed to dequeue from Redis: {}", e);
                             tokio::time::sleep(Duration::from_secs(1)).await;
                             continue; // 继续下一次循环
                         }
@@ -77,7 +102,7 @@ impl SyncController {
                         continue;
                     }
 
-                    logger.log("batch dequeue holder events complete");
+                    app_info!("batch dequeue holder events complete");
 
                     // --- 数据清洗、转换和聚合（单次迭代）---
                     let capacity = datas.len();
@@ -104,7 +129,7 @@ impl SyncController {
                             }
                             Err(e) => {
                                 // todo!: 这里其实也有问题，因为直接丢弃一个事件的话，其实很有可能导致相关代币后续所有信息更新全错
-                                error!(
+                                app_error!(
                                     "Skipping event with invalid delta. Tx: {}, Delta: '{}', Error: {}",
                                     raw_event.tx_signature, raw_event.delta, e
                                 );
@@ -116,10 +141,10 @@ impl SyncController {
                     let mints: Vec<String> = unique_mints.into_iter().collect();
 
                     let untracked_mints = self.database.is_tracked_batch(&mints).await?;
-                    logger.log(&format!("untracked_mints_len:{}", untracked_mints.len()));
+                    app_info!("{}", &format!("untracked_mints_len:{}", untracked_mints.len()));
 
                     self.kafka_queue.batch_enqueue_baseline_task(&untracked_mints).await?;
-                    logger.log("complete batch enqueue baseline");
+                    app_info!("complete batch enqueue baseline");
 
                     // --- 核心职责：将新的数据更新到数据库中 ---
                     // todo!: 这里我想说的就是，对于任意一个数据，一定会进events表，如果这个代币已经构建了baseline，那么可以直接利用从token queue获取的数据更新
@@ -128,22 +153,22 @@ impl SyncController {
                     if !token_events.is_empty() {
 
                         // 对于events表，无论当前代币处于 Not_started baseline_building catching_up synced 任意一个阶段，都需要更新
-                        match self.clickhouse.upsert_events_batch(&token_events, &mut logger).await {
+                        match self.clickhouse.upsert_events_batch(&token_events).await {
                             Ok(()) => {
                                 // ack token_queue message
                                  if let Err(e) = self.kafka_queue.ack_token_events(consumer_name).await {
-                                    error!("Error acknowledging messages: {}", e);
+                                    app_error!("Error acknowledging messages: {}", e);
                                     // ACK 失败是一个严重问题，需要考虑如何处理（重试或告警）
                                     continue;
                                 };
                             } ,
                             Err(e) => {
-                                error!("Error upserting events: {}", e);
+                                app_error!("Error upserting events: {}", e);
                                 // 如果写入数据库失败，我们不应该 ACK 消息，让它可以被重新处理
                                 continue;
                             }
                         };
-                        logger.log("sql upsert events complete");
+                        app_info!("sql upsert events complete");
 
                         // 对于其他的几个表，必须等到代币完成catch-up之后，即tracked_mints.status == synced 才能在这里更新
                         let synced_mints = self.database.filter_synced_mints(&mints).await?;
@@ -160,13 +185,16 @@ impl SyncController {
 
                         // 这俩可能需要绑定在一块
                         if let Err(e) = self.database.upsert_synced_mints_atomic(&synced_token_events, &self.clickhouse).await {
-                            error!("upsert token_account, holders, mint_stats error: {}", e);
+                            app_error!("upsert token_account, holders, mint_stats error: {}", e);
                         }
 
-                        logger.log("sql upsert token_account, holders, mint_stats complete");
+                        app_info!("sql upsert token_account, holders, mint_stats complete");
+                        }
                     }
                 }
             }
+            app_error!("Event consumer loop failed. Retrying in 10 seconds...");
+            tokio::time::sleep(Duration::from_secs(10)).await;
         }
 
         Ok(())
@@ -176,109 +204,145 @@ impl SyncController {
         &self,
         cancellation_token: CancellationToken,
     ) -> Result<()> {
-        // todo!: 这里考虑是否需要全局并发数，将这些配置在.env文件中
-        // todo!: 这里考虑 分离大代币和 小代币，防止大代币长时间占用线程，可以通过创建两个不同的semaphore来实现
-        const MAX_CONCURRENT_BASELINE: usize = 2; // 最大并发执行数
-        const MAX_TASKS_IN_MEMORY: usize = 10; // 内存中最多任务数
-        const DEQUEUE_SIZE: usize = 2; // 批量拉取任务数
-        const BATCH_TIMEOUT_MS: u64 = 100;
+        // 从环境变量读取配置，提供默认值
+        let max_concurrent = std::env::var("BASELINE_MAX_CONCURRENT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+
+        let max_tasks_in_memory = std::env::var("BASELINE_MAX_TASKS_MEMORY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+
+        let dequeue_size = std::env::var("BASELINE_DEQUEUE_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+
+        let batch_timeout_ms = std::env::var("BASELINE_BATCH_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+
+        let max_consecutive_failures = std::env::var("BASELINE_MAX_FAILURES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+
         let consumer_name = "baseline_dequeuer";
 
+        app_info!(
+            "🔧 Baseline Consumer 配置: max_concurrent={}, max_tasks_memory={}, dequeue_size={}, timeout={}ms, max_failures={}",
+            max_concurrent, max_tasks_in_memory, dequeue_size, batch_timeout_ms, max_consecutive_failures
+        );
+
         // execution_semaphore: 控制同时执行的任务数
-        let execution_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_BASELINE));
+        let execution_semaphore = Arc::new(Semaphore::new(max_concurrent));
         // memory_semaphore: 控制内存中的任务总数
         // 如果不要内存控制会导致loop一直出队，调度tokio::spawn，虽然这些任务会因为execution_semaphore的存在不会同时执行，但是一样会导致内存无限制的增加
-        let memory_semaphore = Arc::new(Semaphore::new(MAX_TASKS_IN_MEMORY));
+        let memory_semaphore = Arc::new(Semaphore::new(max_tasks_in_memory));
 
         tokio::time::sleep(Duration::from_secs(10)).await; // 等待消息队列中有一些值
 
-        loop {
-            let mut logger = TaskLogger::new("sync_controller_baseline", "3");
+        'retry_loop: loop {
+            let mut consecutive_failures = 0;
 
-            tokio::select! {
-                // 分支1 收到了取消信息
-                _ = cancellation_token.cancelled() => {
-                    info!("baseline consumer received cancellation signal. Shutting down...");
-                    break;
-                }
-
-                mints_result = self.kafka_queue.batch_dequeue_baseline_task(
-                    consumer_name,
-                    DEQUEUE_SIZE,
-                    BATCH_TIMEOUT_MS as usize,
-                ) => {
-                    let mints = match mints_result {
-                        Ok(m) => m,
-                        Err(e) => {
-                            error!("Failed to dequeue in baseline consumer: {}", e);
-                            continue;
-                        }
-                    };
-
-                    if mints.is_empty() {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        continue;
+            loop {
+                tokio::select! {
+                    // 分支1 收到了取消信息
+                    _ = cancellation_token.cancelled() => {
+                        app_info!("baseline consumer received cancellation signal. Shutting down...");
+                        break 'retry_loop;
                     }
 
-                    logger.log(&format!("Dequeued {} mints for baseline processing", mints.len()));
-                    info!("Dequeued {} mints, memory available: {}/{}",
-                        mints.len(),
-                        memory_semaphore.available_permits(),
-                        MAX_TASKS_IN_MEMORY
-                    );
-
-                    for (_message_id, mint) in mints {
-                        let controller = self.clone();
-                        let exec_sem = execution_semaphore.clone();
-                        let mem_sem = memory_semaphore.clone();
-
-                        // 先获取内存permit，如果内存中任务数达到100，主循环会在这里阻塞
-                        // 当某个任务完成时，会释放memory_permit，主循环恢复
-                        let memory_permit = match mem_sem.acquire_owned().await {
-                            Ok(p) => p,
+                    mints_result = self.kafka_queue.batch_dequeue_baseline_task(
+                        consumer_name,
+                        dequeue_size,
+                        batch_timeout_ms as usize,
+                    ) => {
+                        let mints = match mints_result {
+                            Ok(m) => {
+                                consecutive_failures = 0;
+                                m
+                            },
                             Err(e) => {
-                                error!("Failed to acquire memory semaphore: {}", e);
+                                app_error!("Failed to dequeue in baseline consumer: {}", e);
+                                consecutive_failures += 1;
+                                if consecutive_failures >= max_consecutive_failures {
+                                    app_error!("Failed to dequeue {} times in a row. Restarting consumer.", max_consecutive_failures);
+                                    break;
+                                }
                                 continue;
                             }
                         };
 
-                        let self_clone = self.clone();
-                        tokio::spawn(async move {
-                            // 持有memory_permit，任务结束时自动释放
-                            let _mem_permit = memory_permit;
+                        if mints.is_empty() {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
 
-                            // 在任务内部获取执行permit，不阻塞主循环
-                            let exec_permit = match exec_sem.acquire_owned().await {
+                        app_info!("Dequeued {} mints for baseline processing, memory available: {}/{}",
+                            mints.len(),
+                            memory_semaphore.available_permits(),
+                            max_tasks_in_memory
+                        );
+
+                        for (_message_id, mint) in mints {
+                            let controller = self.clone();
+                            let exec_sem = execution_semaphore.clone();
+                            let mem_sem = memory_semaphore.clone();
+
+                            // 先获取内存permit，如果内存中任务数达到100，主循环会在这里阻塞
+                            // 当某个任务完成时，会释放memory_permit，主循环恢复
+                            let memory_permit = match mem_sem.acquire_owned().await {
                                 Ok(p) => p,
                                 Err(e) => {
-                                    error!("Failed to acquire execution semaphore for mint {}: {}", mint, e);
-                                    return;
+                                    app_error!("Failed to acquire memory semaphore: {}", e);
+                                    continue;
                                 }
                             };
-                            let _exec_permit = exec_permit;
 
-                            // 核心处理
-                            let result = self_clone.process_single_baseline(&mint, false).await;
+                            let self_clone = self.clone();
+                            tokio::spawn(async move {
+                                // 持有memory_permit，任务结束时自动释放
+                                let _mem_permit = memory_permit;
 
-                            // 处理完成后立即ACK
-                            match result {
-                                Ok(_) => {
-                                    // todo!: 暂时对没有处理的大代币也进行ack
-                                    if let Err(e) = controller.kafka_queue.ack_baseline_tasks(consumer_name).await {
-                                        error!("Failed to ACK message {} for mint {}: {}", consumer_name, mint, e);
-                                    } else {
-                                        info!("✅ Baseline completed for mint: {}", mint);
+                                // 在任务内部获取执行permit，不阻塞主循环
+                                let exec_permit = match exec_sem.acquire_owned().await {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        app_error!("Failed to acquire execution semaphore for mint {}: {}", mint, e);
+                                        return;
+                                    }
+                                };
+                                let _exec_permit = exec_permit;
+
+                                // 核心处理
+                                let result = self_clone.process_single_baseline(&mint, false).await;
+
+                                // 处理完成后立即ACK
+                                match result {
+                                    Ok(_) => {
+                                        // todo!: 暂时对没有处理的大代币也进行ack
+                                        if let Err(e) = controller.kafka_queue.ack_baseline_tasks(consumer_name).await {
+                                            app_error!("Failed to ACK message {} for mint {}: {}", consumer_name, mint, e);
+                                        } else {
+                                            app_info!("✅ Baseline completed for mint: {}", mint);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        app_error!("❌ Baseline failed for mint {}: {}", mint, e);
                                     }
                                 }
-                                Err(e) => {
-                                    error!("❌ Baseline failed for mint {}: {}", mint, e);
-                                }
-                            }
-                            // _mem_permit 在这里drop，释放内存槽位
-                        });
+                                // _mem_permit 在这里drop，释放内存槽位
+                            });
+                        }
                     }
                 }
             }
+            app_error!("Baseline consumer loop failed. Retrying in 10 seconds...");
+            tokio::time::sleep(Duration::from_secs(10)).await;
         }
 
         Ok(())
@@ -290,18 +354,18 @@ impl SyncController {
         let onchain_holder_count = self.http_client.get_sol_scan_holder(mint).await?;
         if onchain_holder_count >= *BIG_TOKEN_HOLDER_COUNT {
             // 如果是大代币，直接返回solscan的值
-            info!("big token:{}, holder count: {}", mint, onchain_holder_count);
+            app_info!("big token:{}, holder count: {}", mint, onchain_holder_count);
             return Ok(onchain_holder_count as i64);
         }
 
         // 步骤 1: 构建 baseline 数据
         let baseline_slot = match self.build_baseline(mint).await {
             Ok(slot) => {
-                info!("Baseline data fetched for mint {}, slot: {}", mint, slot);
+                app_info!("Baseline data fetched for mint {}, slot: {}", mint, slot);
                 slot
             }
             Err(e) => {
-                error!("Failed to build baseline for mint {}: {}", mint, e);
+                app_error!("Failed to build baseline for mint {}: {}", mint, e);
                 return Err(e);
             }
         };
@@ -312,7 +376,7 @@ impl SyncController {
             .start_baseline_batch(&[mint.to_string()], &[baseline_slot])
             .await
         {
-            error!("Failed to mark baseline start for mint {}: {}", mint, e);
+            app_error!("Failed to mark baseline start for mint {}: {}", mint, e);
             return Err(e);
         }
 
@@ -322,13 +386,13 @@ impl SyncController {
             .finish_baseline_batch(&[mint.to_string()])
             .await
         {
-            error!("Failed to mark baseline finish for mint {}: {}", mint, e);
+            app_error!("Failed to mark baseline finish for mint {}: {}", mint, e);
             return Err(e);
         }
 
         // 步骤 4: 执行 catch-up，追赶历史事件
         if let Err(e) = self.catch_up(baseline_slot, mint).await {
-            error!("Failed to catch up for mint {}: {}", mint, e);
+            app_error!("Failed to catch up for mint {}: {}", mint, e);
             return Err(e);
         }
 
@@ -338,11 +402,11 @@ impl SyncController {
             .finish_catch_up_batch(&[mint.to_string()])
             .await
         {
-            error!("Failed to mark catch up finish for mint {}: {}", mint, e);
+            app_error!("Failed to mark catch up finish for mint {}: {}", mint, e);
             return Err(e);
         }
 
-        info!("✅ Full baseline pipeline completed for mint: {}", mint);
+        app_info!("✅ Full baseline pipeline completed for mint: {}", mint);
 
         let mut return_count = onchain_holder_count as i64;
         if is_find {
@@ -352,7 +416,7 @@ impl SyncController {
     }
 
     pub async fn build_baseline(&self, mint: &str) -> Result<i64> {
-        info!("start building baseline for: {}", mint);
+        app_info!("start building baseline for: {}", mint);
         let token_accounts = self.http_client.get_token_holders(mint).await?;
 
         let baseline_slot = if !token_accounts.is_empty() {
@@ -375,7 +439,7 @@ impl SyncController {
         let mut cursor = (baseline_slot - 1, i64::MAX);
         let mut total_processed = 0;
 
-        info!(
+        app_info!(
             "Starting catch-up for mint {} from slot {}",
             mint, baseline_slot
         );
@@ -387,7 +451,7 @@ impl SyncController {
             .confirm_events_before_baseline(mint, baseline_slot)
             .await?;
         if skipped_count > 0 {
-            info!(
+            app_info!(
                 "Skipped {} events before baseline_slot {} for mint {}",
                 skipped_count, baseline_slot, mint
             );
@@ -406,7 +470,7 @@ impl SyncController {
                         continue;
                     }
 
-                    info!("In next_cursor to sync mint atomic");
+                    app_info!("In next_cursor to sync mint atomic");
                     self.database
                         .upsert_synced_mints_atomic(&token_events, &self.clickhouse)
                         .await?;
@@ -416,7 +480,7 @@ impl SyncController {
                 }
                 Ok((token_events, None)) => {
                     // 没有更多历史数据，处理最后一批后退出
-                    info!("In none to sync mint atomic");
+                    app_info!("In none to sync mint atomic");
                     if !token_events.is_empty() {
                         self.database
                             .upsert_synced_mints_atomic(&token_events, &self.clickhouse)
@@ -424,14 +488,14 @@ impl SyncController {
                         total_processed += token_events.len();
                     }
 
-                    info!(
+                    app_info!(
                         "Catch-up completed for mint {}: processed {} events",
                         mint, total_processed
                     );
                     break;
                 }
                 Err(e) => {
-                    error!("Failed to get events batch for mint {}: {}", mint, e);
+                    app_error!("Failed to get events batch for mint {}: {}", mint, e);
                     return Err(e);
                 }
             }
@@ -490,7 +554,7 @@ mod tests {
     //         .consume_baseline_mints_for_queue(token)
     //         .await
     //     {
-    //         error!("Monitor error: {:?}", e);
+    //         app_error!("Monitor error: {:?}", e);
     //     }
     // }
 }

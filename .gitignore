@@ -21,6 +21,7 @@ usdc.log
 usdt.log
 usdt.json
 kafka-cli.sh
+kafka-monitor.sh
 kafka-data/
 logs/
 clickhouse-data

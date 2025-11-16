@@ -4,8 +4,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use tracing::{error, info};
-use crate::{AppState, BIG_TOKEN_HOLDER_COUNT};
+use crate::{app_error, app_info, AppState, BIG_TOKEN_HOLDER_COUNT};
 use crate::database::repositories::mint_stats::MintStatsRepository;
 use super::api::{ApiResponse, BatchHolderRequest, HolderInfo};
 
@@ -18,13 +17,13 @@ pub(crate) async fn get_holder_count(
     State(state): State<AppState>,
     Path(mint_address): Path<String>,
 ) -> (StatusCode, Json<ApiResponse<HolderInfo>>) {
-    info!("📊 查询 holder 数量: mint={}", mint_address);
+    app_info!("📊 查询 holder 数量: mint={}", mint_address);
 
     // 步骤 1: 尝试从数据库查询
     match state.postgres.get_holder_account(&mint_address).await {
         Ok(holder_count) => {
             // 数据库中有数据，直接返回
-            info!("✅ 数据库查询成功: mint={}, holders={}", mint_address, holder_count);
+            app_info!("✅ 数据库查询成功: mint={}, holders={}", mint_address, holder_count);
             let holder_info = HolderInfo {
                 mint_address: mint_address.clone(),
                 holder_count,
@@ -36,7 +35,7 @@ pub(crate) async fn get_holder_count(
 
             // 步骤 2: 如果数据库中没有（no rows），调用 process_single_baseline 获取
             if error_msg.contains("no rows") || error_msg.contains("RowNotFound") {
-                info!("⚠️ 数据库中未找到 mint: {}, 尝试构建 baseline", mint_address);
+                app_info!("⚠️ 数据库中未找到 mint: {}, 尝试构建 baseline", mint_address);
 
                 // 调用 process_single_baseline(is_find=true)
                 // 该函数会：
@@ -50,7 +49,7 @@ pub(crate) async fn get_holder_count(
                     .await
                 {
                     Ok(holder_count) => {
-                        info!("✅ 成功获取 holder count: mint={}, holders={}", mint_address, holder_count);
+                        app_info!("✅ 成功获取 holder count: mint={}, holders={}", mint_address, holder_count);
                         let holder_info = HolderInfo {
                             mint_address: mint_address.clone(),
                             holder_count,
@@ -58,7 +57,7 @@ pub(crate) async fn get_holder_count(
                         (StatusCode::OK, Json(ApiResponse::success(holder_info)))
                     }
                     Err(baseline_err) => {
-                        error!("❌ 获取 holder count 失败: mint={}, error={:?}", mint_address, baseline_err);
+                        app_error!("❌ 获取 holder count 失败: mint={}, error={:?}", mint_address, baseline_err);
                         (
                             StatusCode::NOT_FOUND,
                             Json(ApiResponse::error(
@@ -70,7 +69,7 @@ pub(crate) async fn get_holder_count(
                 }
             } else {
                 // 其他数据库错误（非 no rows）
-                error!("❌ 数据库错误: mint={}, error={:?}", mint_address, e);
+                app_error!("❌ 数据库错误: mint={}, error={:?}", mint_address, e);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ApiResponse::error(
@@ -100,11 +99,11 @@ pub(crate) async fn get_holders_batch(
         );
     }
 
-    info!("📊 批量查询 {} 个 mints", req.mint_addresses.len());
+    app_info!("📊 批量查询 {} 个 mints", req.mint_addresses.len());
 
     match state.postgres.get_holder_counts_batch(&req.mint_addresses).await {
         Ok(results) => {
-            info!("✅ 批量查询成功: 返回 {} 个结果", results.len());
+            app_info!("✅ 批量查询成功: 返回 {} 个结果", results.len());
 
             let holder_infos: Vec<HolderInfo> = results
                 .into_iter()
@@ -117,7 +116,7 @@ pub(crate) async fn get_holders_batch(
             (StatusCode::OK, Json(ApiResponse::success(holder_infos)))
         }
         Err(e) => {
-            error!("❌ 批量查询失败: error={:?}", e);
+            app_error!("❌ 批量查询失败: error={:?}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ApiResponse::error("DATABASE_ERROR", "Batch query failed"))
@@ -125,6 +124,3 @@ pub(crate) async fn get_holders_batch(
         }
     }
 }
-
-
-

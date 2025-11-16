@@ -3,10 +3,10 @@ use clickhouse::{Client, Row};
 use fixnum::{typenum, FixedPoint};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+
 use crate::clickhouse::helper::ClickhouseDecimal;
-use crate::EVENT_LOG_TARGET;
-use crate::utils::timer::TaskLogger;
+use crate::{app_info};
+
 use crate::error::{ClickHouseError, Result};
 
 type Money = FixedPoint<i128, typenum::U12>;
@@ -65,13 +65,12 @@ impl ClickHouse {
 
     pub async fn upsert_events_batch(
         &self,
-        events: &[Event],
-        logger: &mut TaskLogger,
+        events: &[Event]
     ) -> Result<()> {
         if events.is_empty() {
             return Ok(());
         }
-        logger.log("start to upsert events");
+        app_info!("start to upsert events");
 
         // 批量插入events（ReplacingMergeTree会自动处理upsert逻辑）
         let mut insert = self.client.insert::<Event>("events").await
@@ -81,7 +80,7 @@ impl ClickHouse {
             })?;
 
         for event in events {
-            info!(target: EVENT_LOG_TARGET, "Upserted event sig:{:?}", event.tx_sig);
+            app_info!("Upserted event sig:{:?}", event.tx_sig);
 
             let new_event = Event {
                 slot: event.slot,
@@ -255,6 +254,7 @@ impl ClickHouse {
 mod tests {
     use super::*;
     use rust_decimal::Decimal;
+    use crate::utils::task_logger::TaskLogger;
 
     fn init_clickhouse() -> ClickHouse {
         ClickHouse::new("http://localhost:8123", "default", "12345")
@@ -275,8 +275,6 @@ mod tests {
         cleanup_events_table().await;
 
         let ch = init_clickhouse();
-        let mut logger = TaskLogger::new("test_upsert", "1");
-
         // 1. 插入3条events
         let events = vec![
             Event {
@@ -311,7 +309,7 @@ mod tests {
             },
         ];
 
-        ch.upsert_events_batch(&events, &mut logger).await.unwrap();
+        ch.upsert_events_batch(&events).await.unwrap();
 
         // 2. 查询验证
         let count: u64 = ch.client
@@ -337,7 +335,7 @@ mod tests {
             },
         ];
 
-        ch.upsert_events_batch(&updated_events, &mut logger).await.unwrap();
+        ch.upsert_events_batch(&updated_events).await.unwrap();
 
         println!("✅ test_upsert_events_batch 测试通过");
     }
@@ -347,7 +345,6 @@ mod tests {
         cleanup_events_table().await;
 
         let ch = init_clickhouse();
-        let mut logger = TaskLogger::new("test_confirm", "1");
 
         // 1. 先插入一些未确认的events
         let events = vec![
@@ -373,7 +370,7 @@ mod tests {
             },
         ];
 
-        ch.upsert_events_batch(&events, &mut logger).await.unwrap();
+        ch.upsert_events_batch(&events).await.unwrap();
 
         // 2. 调用confirm_events
         ch.confirm_events(&events).await.unwrap();

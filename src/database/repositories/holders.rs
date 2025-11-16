@@ -1,7 +1,7 @@
 use rust_decimal::Decimal;
 use std::collections::{HashMap};
 use std::str::FromStr;
-use tracing::warn;
+use crate::app_warn;
 use crate::baseline::get_program_accounts::TokenHolder;
 // 或者你使用的其他日志库
 use crate::clickhouse::clickhouse::Event;
@@ -29,7 +29,7 @@ pub fn aggregate_token_holders(token_accounts: &[TokenHolder]) -> Vec<HolderUpse
         let balance = match ClickhouseDecimal::from_str(&account.balance) {
             Ok(b) => b,
             Err(e) => {
-                warn!(
+                app_warn!(
                     "Failed to parse balance '{}' for account {}. Skipping. Error: {}",
                     account.balance, account.pubkey, e
                 );
