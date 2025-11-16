@@ -124,6 +124,9 @@ pub enum BaselineError {
 
     #[error("RPC 调用超时: {0}")]
     RpcTimeout(String),
+    
+    #[error("Token holder太大, 暂时不支持查询")]
+    HoldersLimit(String),
 
     #[error("解析失败: {operation}, 原因: {source}")]
     ParseFailed {

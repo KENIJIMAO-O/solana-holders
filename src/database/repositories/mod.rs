@@ -270,7 +270,6 @@ impl AtomicityData for DatabaseConnection {
             source: e,
         })?;
 
-        // 6. 审计：记录 mint_stats 变化历史（如果在审计列表中）
         // todo!: 因为使用的两个数据库就是不一样，所以导致现有的框架无法保证两个数据库的数据更新呈现原子性
         tx.commit().await.map_err(|e| DatabaseError::TransactionFailed(
             format!("upsert_synced_mints_atomic: commit failed: {:?}", e)

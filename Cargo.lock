@@ -7070,6 +7070,7 @@ dependencies = [
  "dotenv",
  "fixnum",
  "futures",
+ "once_cell",
  "rand 0.8.5",
  "rayon",
  "rdkafka",

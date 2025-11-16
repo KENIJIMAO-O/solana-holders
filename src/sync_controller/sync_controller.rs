@@ -10,7 +10,9 @@ use crate::database::repositories::AtomicityData;
 use crate::database::repositories::tracked_mints::TrackedMintsRepository;
 use crate::utils::timer::TaskLogger;
 use crate::baseline::HttpClient;
+use crate::BIG_TOKEN_HOLDER_COUNT;
 use crate::clickhouse::clickhouse::{ClickHouse, Event};
+use crate::database::repositories::mint_stats::MintStatsRepository;
 use crate::kafka::KafkaMessageQueue;
 use crate::error::Result;
 
@@ -256,11 +258,12 @@ impl SyncController {
                             let _exec_permit = exec_permit;
 
                             // 核心处理
-                            let result = self_clone.process_single_baseline(controller.clone(), &mint).await;
+                            let result = self_clone.process_single_baseline(&mint, false).await;
 
                             // 处理完成后立即ACK
                             match result {
                                 Ok(_) => {
+                                    // todo!: 暂时对没有处理的大代币也进行ack
                                     if let Err(e) = controller.kafka_queue.ack_baseline_tasks(consumer_name).await {
                                         error!("Failed to ACK message {} for mint {}: {}", consumer_name, mint, e);
                                     } else {
@@ -282,17 +285,17 @@ impl SyncController {
     }
 
     /// 处理单个 mint 的完整 baseline 流程
-    async fn process_single_baseline(&self, controller: SyncController, mint: &str) -> Result<()> {
+    pub async fn process_single_baseline(&self, mint: &str, is_find: bool) -> Result<i64> {
         /// todo!: 这里要做的一件事情是先对holder_count进行判断，如果数量大于某个阈值(20万)，则视为big token，使用其他方式获取
-        const BIG_TOKEN_HOLDER_COUNT: u64 = 10 * 3000;
-        let onchain_holder = self.http_client.get_sol_scan_holder(mint).await?;
-        if onchain_holder >= BIG_TOKEN_HOLDER_COUNT {
-            info!("big token holder count: {}", BIG_TOKEN_HOLDER_COUNT);
-            return Ok(()); // todo!: 返回 Ok 让队列直接 ack 这个mint
+        let onchain_holder_count = self.http_client.get_sol_scan_holder(mint).await?;
+        if onchain_holder_count >= *BIG_TOKEN_HOLDER_COUNT {
+            // 如果是大代币，直接返回solscan的值
+            info!("big token:{}, holder count: {}", mint, onchain_holder_count);
+            return Ok(onchain_holder_count as i64);
         }
 
         // 步骤 1: 构建 baseline 数据
-        let baseline_slot = match controller.build_baseline(mint).await {
+        let baseline_slot = match self.build_baseline(mint).await {
             Ok(slot) => {
                 info!("Baseline data fetched for mint {}, slot: {}", mint, slot);
                 slot
@@ -304,7 +307,7 @@ impl SyncController {
         };
 
         // 步骤 2: 记录 baseline 开始状态
-        if let Err(e) = controller
+        if let Err(e) = self
             .database
             .start_baseline_batch(&[mint.to_string()], &[baseline_slot])
             .await
@@ -314,7 +317,7 @@ impl SyncController {
         }
 
         // 步骤 3: 标记 baseline 完成，进入 catching_up 状态
-        if let Err(e) = controller
+        if let Err(e) = self
             .database
             .finish_baseline_batch(&[mint.to_string()])
             .await
@@ -324,13 +327,13 @@ impl SyncController {
         }
 
         // 步骤 4: 执行 catch-up，追赶历史事件
-        if let Err(e) = controller.catch_up(baseline_slot, mint).await {
+        if let Err(e) = self.catch_up(baseline_slot, mint).await {
             error!("Failed to catch up for mint {}: {}", mint, e);
             return Err(e);
         }
 
         // 步骤 5: 标记 catch-up 完成，进入 synced 状态
-        if let Err(e) = controller
+        if let Err(e) = self
             .database
             .finish_catch_up_batch(&[mint.to_string()])
             .await
@@ -340,7 +343,12 @@ impl SyncController {
         }
 
         info!("✅ Full baseline pipeline completed for mint: {}", mint);
-        Ok(())
+
+        let mut return_count = onchain_holder_count as i64;
+        if is_find {
+            return_count = self.database.get_holder_account(mint).await?;
+        }
+        Ok(return_count)
     }
 
     pub async fn build_baseline(&self, mint: &str) -> Result<i64> {

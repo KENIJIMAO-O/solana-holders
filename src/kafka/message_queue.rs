@@ -61,8 +61,8 @@ impl KafkaMessageQueue {
             return Ok(Arc::clone(consumer));
         }
 
-        // 不存在则创建新的 Consumer（优化版：批量拉取）
-        let consumer: StreamConsumer = ClientConfig::new()
+        let mut client_config = ClientConfig::new();
+        client_config
             .set("bootstrap.servers", &self.config.bootstrap_servers)
             .set("group.id", consumer_group)
             .set(
@@ -74,14 +74,24 @@ impl KafkaMessageQueue {
                 &self.config.consumer_session_timeout_ms,
             )
             .set("auto.offset.reset", "earliest")
-            // --- 核心性能优化：批量拉取 ---
-            // consumer向 Broker拉取消息时：1. 每次 fetch 至少拉取 1MB 数据（而不是拉取单条消息） 2. Broker 等待数据累积的最长时间
-            .set("fetch.min.bytes", "1048576") // 1 MB
-            .set("fetch.wait.max.ms", "100") // 100ms
-            // consumer fetch消息时，不必要每次都从kafka拉取，后面会有一个线程专门从kafka将消息拉到本地缓冲区(内存)，代码直接本地缓存区读取消息
-            .set("queued.min.messages", "5000")
-            // 每次 poll 返回的最大字节数（默认 1MB，提升到 10MB）
-            .set("max.partition.fetch.bytes", "2097152") // 2 MB
+            .set("fetch.wait.max.ms", "100")
+            .set("max.partition.fetch.bytes", "2097152");
+
+        // 根据 consumer 类型设置不同的拉取参数
+        if consumer_name.contains("token_event") {
+            // token-event: 高吞吐（2778 条/秒），使用较大的缓存
+            client_config
+                .set("fetch.min.bytes", "1048576") // 1 MB
+                .set("queued.min.messages", "5000");
+        } else {
+            // baseline: 低吞吐（0.055 条/秒），使用较小的缓存
+            client_config
+                .set("fetch.min.bytes", "524288") // 512 KB
+                .set("queued.min.messages", "500");
+        }
+
+        // 创建 consumer
+        let consumer: StreamConsumer = client_config
             .create()
             .map_err(|e| KafkaError::ConsumerCreationFailed(format!("Failed to create Kafka consumer: {}", e)))?;
 

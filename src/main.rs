@@ -6,9 +6,12 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-use solana_holders::{EVENT_LOG_TARGET, Server};
+use solana_holders::{EVENT_LOG_TARGET, initialize_system, start_background_services, create_app, wait_for_background_tasks};
 use std::env;
-use tracing::Level;
+use std::time::Duration;
+use tokio::signal;
+use tokio_util::sync::CancellationToken;
+use tracing::{info, warn, Level};
 use tracing_appender::non_blocking::NonBlockingBuilder;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::filter::filter_fn;
@@ -53,27 +56,83 @@ async fn main() {
         .with(events_subscriber)
         .init();
 
-    let server = Server {};
-    if let Err(e) = server.run().await {
-        print_error_chain(&e);
-        let exit_code = match &e {
-            SolanaHoldersError::Config(_) => {
-                tracing::error!("配置错误，请检查环境变量");
-                2
-            }
-            _ if e.is_connection_error() => {
-                tracing::error!("连接错误，请检查网络和服务状态");
-                3
-            }
-            _ => {
-                tracing::error!("运行时错误");
-                1
-            }
-        };
 
-        std::process::exit(exit_code);
+
+    let grpc_url = std::env::var("GRPC_URL")
+        .expect("GRPC_URL environment variable must be set");
+    let db_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL environment variable must be set");
+    let clickhouse_url = std::env::var("CLICKHOUSE_URL")
+        .expect("CLICKHOUSE_URL environment variable must be set");
+    let database_name = std::env::var("CLICKHOUSE_DATABASE_NAME")
+        .expect("CLICKHOUSE_DATABASE_NAME environment variable must be set");
+    let password = std::env::var("CLICKHOUSE_PASSWORD")
+        .expect("CLICKHOUSE_PASSWORD environment variable must be set");
+
+    let app_state = initialize_system(
+        grpc_url,
+        db_url,
+        clickhouse_url,
+        database_name,
+        password
+    ).await.unwrap();
+    // 创建全局取消令牌
+    let cancellation_token = CancellationToken::new();
+
+    // 启动后台服务并收集JoinHandle
+    let background_handles = start_background_services(
+        app_state.onchain_monitor.clone(),
+        app_state.postgres.clone(),
+        app_state.clickhouse.clone(),
+        app_state.sync_controller.clone(),
+        cancellation_token.clone(),
+    ).await.unwrap();
+
+    // 构建应用（克隆 app_state 因为 create_app 会消耗它）
+    let app = create_app(app_state.clone()).await;
+
+    let server_url = env::var("SERVER_URL").unwrap();
+    let listener = tokio::net::TcpListener::bind(&server_url).await.unwrap();
+    info!("Server starting on {}", server_url);
+
+    tokio::select! {
+        result = axum::serve(listener, app) => {
+            if let Err(e) = result {
+                warn!("Server error: {:?}", e);
+            }
+        }
+        _ = signal::ctrl_c() => {
+            info!("Received Ctrl+C, initiating graceful shutdown...");
+        }
     }
+
+    // 发送关闭信号
+    cancellation_token.cancel();
+    info!("Shutdown signal sent, waiting for background tasks...");
+
+    // 等待所有后台任务完成，最多等15秒
+    let shutdown_timeout = Duration::from_secs(15);
+    let shutdown_result = tokio::time::timeout(
+        shutdown_timeout,
+        wait_for_background_tasks(background_handles),
+    )
+        .await;
+
+    match shutdown_result {
+        Ok(_) => {
+            info!("All background tasks completed successfully");
+        }
+        Err(_) => {
+            warn!("Shutdown timeout reached, some tasks may still be running");
+        }
+    }
+
+    // 优雅关闭数据库连接池
+    info!("Closing database connection pool...");
+    app_state.postgres.pool.close().await;
+    info!("Database connections closed. Shutdown complete.");
 }
+
 
 /// 打印完整的错误链
 fn print_error_chain(err: &SolanaHoldersError) {
