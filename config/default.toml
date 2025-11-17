@@ -1,6 +1,8 @@
 # =========== 对账 ============
 # 默认的对账时间间隔
 default_interval_hours = 72
+# dues对账代币数量
+dues_batch_size = 1000
 
 [[scheduling_tiers]]
 threshold_percent = 100

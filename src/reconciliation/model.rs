@@ -19,6 +19,7 @@ pub struct AuditConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
     pub default_interval_hours: i32,
+    pub dues_batch_size: i64,
     pub scheduling_tiers: Vec<SchedulingTier>,
     pub audit: Option<AuditConfig>,
 }

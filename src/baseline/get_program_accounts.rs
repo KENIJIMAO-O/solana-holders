@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::pin::Pin;
 use std::str::FromStr;
+use std::time::Duration;
 use crate::app_info;
 
 #[derive(Debug, Deserialize, Serialize)] // 使用 Debug trait 方便打印调试
@@ -36,6 +37,7 @@ impl HttpClient {
             .http_client
             .post(&self.rpc_url)
             .header("Content-Type", "application/json")
+            .timeout(Duration::from_secs(30)) // 默认30s超时
             .json(&request_body)
             .send()
             .await

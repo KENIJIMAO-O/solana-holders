@@ -271,10 +271,10 @@ impl AtomicityData for DatabaseConnection {
         })?;
 
         // todo!: 因为使用的两个数据库就是不一样，所以导致现有的框架无法保证两个数据库的数据更新呈现原子性
+        clickhouse.confirm_events(synced_events).await?;
         tx.commit().await.map_err(|e| DatabaseError::TransactionFailed(
             format!("upsert_synced_mints_atomic: commit failed: {:?}", e)
         ))?;
-        clickhouse.confirm_events(synced_events).await?;
 
         Ok(())
     }

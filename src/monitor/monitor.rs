@@ -293,7 +293,6 @@ impl Monitor {
         let tx_count = sub_block.transactions.len();
         app_info!("📦 Slot {}: 开始处理 {} 笔交易", block_slot, tx_count);
 
-        app_info!("start to handle whole txs in a slot");
         // 并发处理所有交易
         let transactions = sub_block.transactions; // 将所有权移出
 
@@ -321,7 +320,6 @@ impl Monitor {
         let target_instruction_count = all_events.len();
 
         // 批量发送到消息队列
-        app_info!("start to push events to message queue");
         if !all_events.is_empty() {
             message_queue
                 .batch_enqueue_holder_event(all_events)

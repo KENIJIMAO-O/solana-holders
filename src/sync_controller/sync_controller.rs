@@ -147,9 +147,9 @@ impl SyncController {
                     app_info!("complete batch enqueue baseline");
 
                     // --- 核心职责：将新的数据更新到数据库中 ---
-                    // todo!: 这里我想说的就是，对于任意一个数据，一定会进events表，如果这个代币已经构建了baseline，那么可以直接利用从token queue获取的数据更新
-                    // todo!: 如果没有构建baseline，那么就不用更新，等到构建完之后，catch-up需要从数据中将所有和他相关的events全部合并之后，回到token queue
-                    // todo!: 所以对于数据库中的数据需要更新三次，第一是baseline构建的时候的更新，第二是catch-up时候的更新，最后是当前函数中token queue的更新
+                    // 这里我想说的就是，对于任意一个数据，一定会进events表，如果这个代币已经构建了baseline，那么可以直接利用从token queue获取的数据更新
+                    // 如果没有构建baseline，那么就不用更新，等到构建完之后，catch-up需要从数据中将所有和他相关的events全部合并之后，回到token queue
+                    // 所以对于数据库中的数据需要更新三次，第一是baseline构建的时候的更新，第二是catch-up时候的更新，最后是当前函数中token queue的更新
                     if !token_events.is_empty() {
 
                         // 对于events表，无论当前代币处于 Not_started baseline_building catching_up synced 任意一个阶段，都需要更新
@@ -350,7 +350,7 @@ impl SyncController {
 
     /// 处理单个 mint 的完整 baseline 流程
     pub async fn process_single_baseline(&self, mint: &str, is_find: bool) -> Result<i64> {
-        /// todo!: 这里要做的一件事情是先对holder_count进行判断，如果数量大于某个阈值(20万)，则视为big token，使用其他方式获取
+        // 如果数量大于某个阈值，则视为big token，使用其他方式获取
         let onchain_holder_count = self.http_client.get_sol_scan_holder(mint).await?;
         if onchain_holder_count >= *BIG_TOKEN_HOLDER_COUNT {
             // 如果是大代币，直接返回solscan的值

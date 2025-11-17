@@ -13,16 +13,46 @@ use crate::database::repositories::reconciliation_schedule::ReconciliationSchedu
 use crate::error::{ReconciliationError, Result};
 
 
-/// 手动对账结果
+/// 对账运行时配置
 #[derive(Debug, Clone)]
-pub struct ManualReconciliationResult {
-    pub mint_pubkey: String,
-    pub db_holder_count: i64,
-    pub onchain_holder_count: Option<i64>, // RPC 失败时为 None
-    pub difference: Option<i64>,
-    pub difference_percentage: Option<f64>,
-    pub success: bool,
-    pub error_message: Option<String>,
+struct ReconciliationConfig {
+    max_concurrent: usize,
+    max_difference_percent: u64,
+    timeout_seconds: u64,
+}
+
+impl ReconciliationConfig {
+    fn from_env() -> Self {
+        let max_concurrent = std::env::var("RECONCILIATION_MAX_CONCURRENT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+
+        let max_difference_percent = std::env::var("RECONCILIATION_MAX_DIFFERENCE")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(10);
+
+        let timeout_seconds = std::env::var("RECONCILIATION_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(300);
+
+        Self {
+            max_concurrent,
+            max_difference_percent,
+            timeout_seconds,
+        }
+    }
+}
+
+/// 单个对账任务的结果
+#[derive(Debug)]
+struct ReconciliationTaskResult {
+    mint_pubkey: String,
+    db_holder_count: i64,
+    last_holder_count: i64,
+    onchain_result: Result<u64>,
 }
 
 impl ReconciliationServer {
@@ -53,14 +83,17 @@ impl ReconciliationServer {
         })
     }
 
-    // 1.从表中获获取需要对账的mint，对其实行对账，对账完需要更新 对账时间
     pub async fn start_with_cancellation(
         &self,
         cancellation_token: CancellationToken,
     ) -> Result<()> {
-        const MAX_CONCURRENT_RECONCILIATION: usize = 10; // 最大并发数
-        const MAX_DIFFERENCE: u64 = 10;                  // 对账允许误差的百分比（对于持有者越多的代币允许的误差就应该越小）
-        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_RECONCILIATION));
+        // 加载配置
+        let config = ReconciliationConfig::from_env();
+
+        app_info!(
+            "🔧 Reconciliation 配置: max_concurrent={}, max_difference={}%, timeout={}s",
+            config.max_concurrent, config.max_difference_percent, config.timeout_seconds
+        );
 
         loop {
             tokio::select! {
@@ -68,226 +101,17 @@ impl ReconciliationServer {
                     app_info!("reconciliation server received cancellation signal. Shutting down...");
                     break;
                 }
-                data = self.database.get_due_mints() => {
+                data = self.database.get_due_mints(self.app_config.dues_batch_size) => {
                     match data {
-                        Ok(due_mints) => {
-                            if due_mints.is_empty() {
-                                // 没有需要对账的 mint，等待一段时间后继续
-                                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-                                continue;
+                        Ok(due_mints) if !due_mints.is_empty() => {
+                            // 处理这批对账任务
+                            if let Err(e) = self.process_reconciliation_batch(due_mints, &config).await {
+                                app_error!("Failed to process reconciliation batch: {}", e);
                             }
-
-                            app_info!("Found {} mints due for reconciliation", due_mints.len());
-
-                            // 提取所有 mint_pubkeys
-                            let mint_pubkeys: Vec<String> = due_mints
-                                .iter()
-                                .map(|schedule| schedule.mint_pubkey.clone())
-                                .collect();
-
-                            // 批量查询当前数据库中的 holder_count
-                            let db_holder_counts = match self.database.get_holder_counts_batch(&mint_pubkeys).await {
-                                Ok(counts) => counts,
-                                Err(e) => {
-                                    app_error!("Failed to get holder counts from database: {}", e);
-                                    continue;
-                                }
-                            };
-
-                            // 构建 HashMap 方便查找
-                            let db_counts_map: HashMap<String, i64> = db_holder_counts.into_iter().collect();
-
-                            // 使用 Semaphore 控制并发，spawn 多个任务获取链上数据
-                            let mut handles = Vec::new();
-
-                            for schedule in due_mints {
-                                let permit = match semaphore.clone().acquire_owned().await {
-                                    Ok(p) => p,
-                                    Err(e) => {
-                                        app_error!("Failed to acquire semaphore: {}", e);
-                                        continue;
-                                    }
-                                };
-                                let http_client = self.http_client.clone();
-                                let mint_pubkey = schedule.mint_pubkey.clone();
-
-                                // 获取数据库中的当前 holder_count
-                                let current_db_count = db_counts_map.get(&mint_pubkey).copied().unwrap_or(0);
-
-                                // 进行对账
-                                let handle = tokio::spawn(async move {
-                                    let _permit = permit; // 持有 permit，函数结束时释放
-
-                                    // todo!: 算了，暂时先直接通过api获取吧，后续在进行其他的考虑
-                                    // let onchain_result = http_client.get_token_holders(&mint_pubkey).await;
-                                    let onchain_result = http_client.get_sol_scan_holder(&mint_pubkey).await;
-                                    (schedule, current_db_count, onchain_result)
-                                });
-
-                                handles.push(handle);
-                            }
-
-                            // 等待所有任务完成
-                            app_info!("Waiting for all reconciliation tasks to complete");
-                            let results = futures::future::join_all(handles).await;
-
-                            // 处理结果
-                            for result in results {
-                                match result {
-                                    Ok((schedule, current_db_count, onchain_result)) => {
-                                        match onchain_result {
-                                            Ok(holders_count) => {
-                                                let holders_count = holders_count as i64;
-                                                // let onchain_holder_count = holders.len() as i64;
-
-                                                // 计算变化百分比（数据库变化）
-                                                let change_percentage = if schedule.last_holder_count > 0 {
-                                                    (current_db_count - schedule.last_holder_count).abs() as f64
-                                                        / schedule.last_holder_count as f64 * 100.0
-                                                } else {
-                                                    0.0
-                                                };
-
-                                                // todo!: 这里要判断数据库中的人数与链上人数是否正确，目前这样的判断方式有点草率，因为没有考虑slot的问题
-                                                // 如果系统更新的slot本身就要比 get_holders_count 要慢，那人数很可能就对不上
-                                                // 如果是这样情况，先搞个数据库表将get_holders_count的数据存起来？然后等到执行到了这个slot再拿出来比较？
-                                                let difference = if current_db_count > holders_count {
-                                                    current_db_count - holders_count
-                                                } else { holders_count - current_db_count};
-
-                                                // 检查是否需要重建（避免除零错误）
-                                                let needs_rebuild = if current_db_count == 0 {
-                                                    // 数据库为空但链上有 holder，需要重建
-                                                    if holders_count > 0 {
-                                                        app_warn!(
-                                                            "Token:{} has {} holders onchain but 0 in db, needs rebuild",
-                                                            &schedule.mint_pubkey,
-                                                            holders_count
-                                                        );
-                                                        true
-                                                    } else {
-                                                        // 两者都为 0，不需要重建
-                                                        false
-                                                    }
-                                                } else {
-                                                    // 正常计算差异百分比
-                                                    let difference_percentage = difference * 100 / current_db_count;
-                                                    if difference_percentage > MAX_DIFFERENCE as i64 {
-                                                        app_error!(
-                                                            "Token:{} count in db {} is not same as onchain count {}, difference: {}%",
-                                                            &schedule.mint_pubkey,
-                                                            current_db_count,
-                                                            holders_count,
-                                                            difference_percentage
-                                                        );
-                                                        true
-                                                    } else {
-                                                        false
-                                                    }
-                                                };
-
-                                                // 如果需要重建，执行重建流程
-                                                if needs_rebuild {
-                                                    app_info!(
-                                                        "Starting rebuild for mint {} due to significant difference",
-                                                        &schedule.mint_pubkey
-                                                    );
-
-                                                    // 重新获取完整的 holder 列表用于重建
-                                                    match self.http_client.get_token_holders(&schedule.mint_pubkey).await {
-                                                        Ok(holders) => {
-                                                            if !holders.is_empty() {
-                                                                match self.database
-                                                                    .establish_baseline_atomic(&schedule.mint_pubkey, holders)
-                                                                    .await
-                                                                {
-                                                                    Ok(baseline_slot) => {
-                                                                        app_info!(
-                                                                            "Rebuilt baseline for mint {} at slot {}",
-                                                                            &schedule.mint_pubkey, baseline_slot
-                                                                        );
-
-                                                                        // 执行 catch-up
-                                                                        if let Err(e) = self.catch_up(baseline_slot, &schedule.mint_pubkey).await {
-                                                                            app_error!(
-                                                                                "Failed to catch up for mint {} after rebuild: {}",
-                                                                                &schedule.mint_pubkey, e
-                                                                            );
-                                                                        } else {
-                                                                            app_info!(
-                                                                                "✅ Successfully rebuilt and caught up for mint {}",
-                                                                                &schedule.mint_pubkey
-                                                                            );
-                                                                        }
-                                                                    }
-                                                                    Err(e) => {
-                                                                        app_error!(
-                                                                            "Failed to establish baseline for mint {}: {}",
-                                                                            &schedule.mint_pubkey, e
-                                                                        );
-                                                                    }
-                                                                }
-                                                            } else {
-                                                                app_warn!(
-                                                                    "Got empty holders list for mint {}, skipping rebuild",
-                                                                    &schedule.mint_pubkey
-                                                                );
-                                                            }
-                                                        }
-                                                        Err(e) => {
-                                                            app_error!(
-                                                                "Failed to get token holders for rebuild of mint {}: {}",
-                                                                &schedule.mint_pubkey, e
-                                                            );
-                                                        }
-                                                    }
-                                                }
-
-                                                // 根据一段时间内的代币持有者人数变化百分比决定下次对账间隔
-                                                let next_interval_hours = Self::determine_next_interval(change_percentage, &self.app_config);
-
-                                                // 更新 schedule
-                                                if let Err(e) = self.database.update_schedule_after_reconciliation(
-                                                    &schedule.mint_pubkey,
-                                                    current_db_count,
-                                                    next_interval_hours
-                                                ).await {
-                                                    app_error!("Failed to update schedule for mint {}: {}", schedule.mint_pubkey, e);
-                                                } else {
-                                                    app_info!(
-                                                        "✅ Reconciliation completed for mint {}: onchain={}, db={}, next_interval={}h",
-                                                        schedule.mint_pubkey, holders_count, current_db_count, next_interval_hours
-                                                    );
-                                                }
-                                            }
-                                            Err(e) => {
-                                                // RPC 调用失败，仍然更新 schedule（基于数据库变化）
-                                                app_warn!("Failed to get onchain data for mint {}: {}", schedule.mint_pubkey, e);
-
-                                                let change_percentage = if schedule.last_holder_count > 0 {
-                                                    (current_db_count - schedule.last_holder_count).abs() as f64
-                                                        / schedule.last_holder_count as f64 * 100.0
-                                                } else {
-                                                    0.0
-                                                };
-
-                                                let next_interval_hours = Self::determine_next_interval(change_percentage, &self.app_config);
-
-                                                if let Err(e) = self.database.update_schedule_after_reconciliation(
-                                                    &schedule.mint_pubkey,
-                                                    current_db_count,
-                                                    next_interval_hours
-                                                ).await {
-                                                    app_error!("Failed to update schedule for mint {}: {}", schedule.mint_pubkey, e);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        app_error!("Task panicked: {}", e);
-                                    }
-                                }
-                            }
+                        }
+                        Ok(_) => {
+                            // 没有需要对账的 mint，等待一段时间后继续
+                            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
                         }
                         Err(err) => {
                             app_error!("Failed to get due mints: {:?}", err);
@@ -301,6 +125,14 @@ impl ReconciliationServer {
         Ok(())
     }
 
+    fn calculate_change_percentage(current: i64, last: i64) -> f64 {
+        if last > 0 {
+            (current - last).abs() as f64 / last as f64 * 100.0
+        } else {
+            0.0
+        }
+    }
+
     fn determine_next_interval(change_percentage: f64, config: &AppConfig) -> i32 {
         for tier in &config.scheduling_tiers {
             if change_percentage >= tier.threshold_percent {
@@ -308,6 +140,266 @@ impl ReconciliationServer {
             }
         }
         config.default_interval_hours
+    }
+
+    /// 根据数据库持有者数量变化更新对账计划
+    async fn update_schedule_based_on_db_change(
+        &self,
+        mint_pubkey: &str,
+        current_db_count: i64,
+        last_holder_count: i64,
+    ) -> Result<i32> {
+        let change_percentage = Self::calculate_change_percentage(
+            current_db_count,
+            last_holder_count
+        );
+
+        let next_interval_hours = Self::determine_next_interval(
+            change_percentage,
+            &self.app_config
+        );
+
+        self.database
+            .update_schedule_after_reconciliation(
+                mint_pubkey,
+                current_db_count,
+                next_interval_hours
+            )
+            .await?;
+
+        Ok(next_interval_hours)
+    }
+
+    /// 批量查询数据库中的 holder counts
+    async fn fetch_db_holder_counts(
+        &self,
+        mint_pubkeys: &[String],
+    ) -> Result<HashMap<String, i64>> {
+        let db_holder_counts = self.database.get_holder_counts_batch(mint_pubkeys).await?;
+        Ok(db_holder_counts.into_iter().collect())
+    }
+
+    /// 并发获取链上数据
+    async fn fetch_onchain_data_concurrently(
+        &self,
+        due_mints: Vec<crate::database::repositories::reconciliation_schedule::ReconciliationSchedule>,
+        db_counts_map: &HashMap<String, i64>,
+        config: &ReconciliationConfig,
+    ) -> Vec<std::result::Result<ReconciliationTaskResult, tokio::task::JoinError>> {
+        let semaphore = Arc::new(Semaphore::new(config.max_concurrent));
+        let mut handles = Vec::new();
+
+        for schedule in due_mints {
+            let permit = match semaphore.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(e) => {
+                    app_error!("Failed to acquire semaphore: {}", e);
+                    continue;
+                }
+            };
+
+            let http_client = self.http_client.clone();
+            let mint_pubkey = schedule.mint_pubkey.clone();
+            let current_db_count = db_counts_map.get(&mint_pubkey).copied().unwrap_or(0);
+            let last_holder_count = schedule.last_holder_count;
+
+            let handle = tokio::spawn(async move {
+                let _permit = permit;
+
+                // todo!: 算了，暂时先直接通过api获取吧，后续在进行其他的考虑
+                // let onchain_result = http_client.get_token_holders(&mint_pubkey).await;
+                let onchain_result = http_client.get_sol_scan_holder(&mint_pubkey).await;
+
+                ReconciliationTaskResult {
+                    mint_pubkey,
+                    db_holder_count: current_db_count,
+                    last_holder_count,
+                    onchain_result,
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        futures::future::join_all(handles).await
+    }
+
+    /// 判断是否需要重建
+    fn should_rebuild(
+        &self,
+        db_count: i64,
+        onchain_count: i64,
+        config: &ReconciliationConfig,
+    ) -> bool {
+        if db_count == 0 {
+            // 数据库为空但链上有 holder，需要重建
+            return onchain_count > 0;
+        }
+
+        // 正常计算差异百分比
+        let difference = (db_count - onchain_count).abs();
+        let difference_percentage = difference * 100 / db_count;
+        difference_percentage > config.max_difference_percent as i64
+    }
+
+    /// 执行重建和追赶流程
+    async fn rebuild_and_catchup(&self, mint_pubkey: &str) -> Result<()> {
+        app_info!("Starting rebuild for mint {} due to significant difference", mint_pubkey);
+
+        // 重新获取完整的 holder 列表用于重建
+        let holders = self.http_client.get_token_holders(mint_pubkey).await?;
+
+        if holders.is_empty() {
+            app_warn!("Got empty holders list for mint {}, skipping rebuild", mint_pubkey);
+            return Ok(());
+        }
+
+        // 建立 baseline
+        let baseline_slot = self.database
+            .establish_baseline_atomic(mint_pubkey, holders)
+            .await?;
+
+        app_info!("Rebuilt baseline for mint {} at slot {}", mint_pubkey, baseline_slot);
+
+        // 执行 catch-up
+        self.catch_up(baseline_slot, mint_pubkey).await?;
+
+        app_info!("✅ Successfully rebuilt and caught up for mint {}", mint_pubkey);
+        Ok(())
+    }
+
+    /// 处理单个对账结果
+    async fn process_single_reconciliation_result(
+        &self,
+        task_result: ReconciliationTaskResult,
+        config: &ReconciliationConfig,
+    ) -> Result<()> {
+        match task_result.onchain_result {
+            Ok(holders_count) => {
+                let holders_count = holders_count as i64;
+
+                // 检查是否需要重建
+                let needs_rebuild = self.should_rebuild(
+                    task_result.db_holder_count,
+                    holders_count,
+                    config,
+                );
+
+                if needs_rebuild {
+                    let difference = (task_result.db_holder_count - holders_count).abs();
+
+                    if task_result.db_holder_count == 0 {
+                        app_warn!(
+                            "Token:{} has {} holders onchain but 0 in db, needs rebuild",
+                            &task_result.mint_pubkey,
+                            holders_count
+                        );
+                    } else {
+                        let difference_percentage = difference * 100 / task_result.db_holder_count;
+                        app_error!(
+                            "Token:{} count in db {} is not same as onchain count {}, difference: {}%",
+                            &task_result.mint_pubkey,
+                            task_result.db_holder_count,
+                            holders_count,
+                            difference_percentage
+                        );
+                    }
+
+                    // 执行重建流程
+                    if let Err(e) = self.rebuild_and_catchup(&task_result.mint_pubkey).await {
+                        app_error!("Failed to rebuild mint {}: {}", task_result.mint_pubkey, e);
+                    }
+                }
+
+                // 根据数据库持有者数量变化更新对账计划
+                match self.update_schedule_based_on_db_change(
+                    &task_result.mint_pubkey,
+                    task_result.db_holder_count,
+                    task_result.last_holder_count,
+                ).await {
+                    Ok(next_interval_hours) => {
+                        app_info!(
+                            "✅ Reconciliation completed for mint {}: onchain={}, db={}, next_interval={}h",
+                            task_result.mint_pubkey,
+                            holders_count,
+                            task_result.db_holder_count,
+                            next_interval_hours
+                        );
+                    }
+                    Err(e) => {
+                        app_error!("Failed to update schedule for mint {}: {}", task_result.mint_pubkey, e);
+                    }
+                }
+            }
+            Err(e) => {
+                // RPC 调用失败，仍然更新 schedule（基于数据库变化）
+                app_warn!("Failed to get onchain data for mint {}: {}", task_result.mint_pubkey, e);
+
+                if let Err(e) = self.update_schedule_based_on_db_change(
+                    &task_result.mint_pubkey,
+                    task_result.db_holder_count,
+                    task_result.last_holder_count,
+                ).await {
+                    app_error!("Failed to update schedule for mint {}: {}", task_result.mint_pubkey, e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 处理一批对账任务
+    async fn process_reconciliation_batch(
+        &self,
+        due_mints: Vec<crate::database::repositories::reconciliation_schedule::ReconciliationSchedule>,
+        config: &ReconciliationConfig,
+    ) -> Result<()> {
+        let total_mints = due_mints.len();
+        app_info!("Found {} mints due for reconciliation", total_mints);
+
+        // 1. 提取所有 mint_pubkeys
+        let mint_pubkeys: Vec<String> = due_mints
+            .iter()
+            .map(|schedule| schedule.mint_pubkey.clone())
+            .collect();
+
+        // 2. 批量查询当前数据库中的 holder_count
+        let db_counts_map = self.fetch_db_holder_counts(&mint_pubkeys).await?;
+
+        // 3. 并发获取链上数据
+        app_info!("Waiting for all reconciliation tasks to complete (timeout: {}s)", config.timeout_seconds);
+
+        let timeout_duration = tokio::time::Duration::from_secs(config.timeout_seconds);
+        let results = match tokio::time::timeout(
+            timeout_duration,
+            self.fetch_onchain_data_concurrently(due_mints, &db_counts_map, config)
+        ).await {
+            Ok(results) => results,
+            Err(_) => {
+                app_error!(
+                    "Reconciliation batch timeout after {}s for {} mints, skipping this batch",
+                    config.timeout_seconds,
+                    total_mints
+                );
+                return Ok(());
+            }
+        };
+
+        // 4. 处理结果
+        for result in results {
+            match result {
+                Ok(task_result) => {
+                    if let Err(e) = self.process_single_reconciliation_result(task_result, config).await {
+                        app_error!("Failed to process reconciliation result: {}", e);
+                    }
+                }
+                Err(e) => {
+                    app_error!("Task panicked: {}", e);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// 从 baseline_slot 追赶到当前已有的历史事件
@@ -381,119 +473,5 @@ impl ReconciliationServer {
         }
 
         Ok(())
-    }
-
-    /// 手动对账：对指定的 mints 立即执行对账检查
-    ///
-    /// 不更新 schedule 表，仅返回对账结果
-    pub async fn reconcile_manual(
-        &self,
-        mint_pubkeys: &[String],
-    ) -> Result<Vec<ManualReconciliationResult>> {
-        if mint_pubkeys.is_empty() {
-            return Ok(vec![]);
-        }
-
-        const MAX_CONCURRENT: usize = 10;
-        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
-
-        app_info!(
-            "Starting manual reconciliation for {} mints",
-            mint_pubkeys.len()
-        );
-
-        // 1. 批量查询数据库中的 holder_count
-        let db_holder_counts = self.database.get_holder_counts_batch(mint_pubkeys)
-            .await
-            .map_err(|e| ReconciliationError::ReconcileManualFailed{
-                method: "get holder counts batch error".to_string(),
-                source: Box::from(e)
-            })?;
-        let db_counts_map: HashMap<String, i64> = db_holder_counts.into_iter().collect();
-
-        // 2. 并发获取链上数据
-        let mut handles = Vec::new();
-
-        for mint_pubkey in mint_pubkeys {
-            let permit = match semaphore.clone().acquire_owned().await {
-                Ok(p) => p,
-                Err(e) => {
-                    app_error!("Failed to acquire semaphore: {}", e);
-                    continue;
-                }
-            };
-            let http_client = self.http_client.clone();
-            let mint = mint_pubkey.clone();
-            let db_count = db_counts_map.get(mint_pubkey).copied().unwrap_or(0);
-
-            let handle = tokio::spawn(async move {
-                let _permit = permit;
-
-                let onchain_result = http_client.get_token_holders(&mint).await;
-
-                (mint, db_count, onchain_result)
-            });
-
-            handles.push(handle);
-        }
-
-        // 3. 等待所有任务完成并处理结果
-        let results = futures::future::join_all(handles).await;
-        let mut reconciliation_results = Vec::new();
-
-        for result in results {
-            match result {
-                Ok((mint_pubkey, db_count, onchain_result)) => match onchain_result {
-                    Ok(holders) => {
-                        let onchain_count = holders.len() as i64;
-                        let difference = onchain_count - db_count;
-                        let difference_percentage = if db_count > 0 {
-                            Some(difference.abs() as f64 / db_count as f64 * 100.0)
-                        } else {
-                            None
-                        };
-
-                        reconciliation_results.push(ManualReconciliationResult {
-                            mint_pubkey: mint_pubkey.clone(),
-                            db_holder_count: db_count,
-                            onchain_holder_count: Some(onchain_count),
-                            difference: Some(difference),
-                            difference_percentage,
-                            success: true,
-                            error_message: None,
-                        });
-
-                        app_info!(
-                            "✅ Manual reconciliation for {}: onchain={}, db={}, diff={}",
-                            mint_pubkey, onchain_count, db_count, difference
-                        );
-                    }
-                    Err(e) => {
-                        app_warn!("Failed to get onchain data for mint {}: {}", mint_pubkey, e);
-
-                        reconciliation_results.push(ManualReconciliationResult {
-                            mint_pubkey: mint_pubkey.clone(),
-                            db_holder_count: db_count,
-                            onchain_holder_count: None,
-                            difference: None,
-                            difference_percentage: None,
-                            success: false,
-                            error_message: Some(e.to_string()),
-                        });
-                    }
-                },
-                Err(e) => {
-                    app_error!("Task panicked during manual reconciliation: {}", e);
-                }
-            }
-        }
-
-        app_info!(
-            "Manual reconciliation completed: {}/{} successful",
-            reconciliation_results.iter().filter(|r| r.success).count(),
-            reconciliation_results.len()
-        );
-
-        Ok(reconciliation_results)
     }
 }

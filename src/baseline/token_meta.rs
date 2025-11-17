@@ -1,9 +1,11 @@
+use std::time::Duration;
 use crate::baseline::HttpClient;
 use crate::error::{BaselineError, Result};
 use serde_json::Value;
 
 impl HttpClient {
     pub async fn get_sol_scan_holder(&self, mint: &str) -> Result<u64> {
+
         let base_url = &self.base_url;
         let url = format!("{}{}", base_url, mint);
 
@@ -29,11 +31,17 @@ impl HttpClient {
     }
 
     async fn get_token_meta(&self, url: &str) -> Result<String> {
+        // 从solscan拿数据，默认30s超时
+        let timeout_seconds = std::env::var("SOLSCAN_REQUEST_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
         let response = self
             .http_client
             .get(url)
             .header("content-type", "application/json")
             .header("token", &self.sol_scan_token) // "token" 是自定义的 header 名称
+            .timeout(Duration::from_secs(timeout_seconds))
             .send()
             .await
             .map_err(|e| BaselineError::RpcCallFailed {

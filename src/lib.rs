@@ -14,6 +14,7 @@ use crate::sync_controller::sync_controller::SyncController;
 use crate::clickhouse::clickhouse::ClickHouse;
 use crate::kafka::{KafkaMessageQueue, KafkaQueueConfig};
 use crate::error::{KafkaError, Result};
+use crate::reconciliation::model::ReconciliationServer;
 
 pub mod baseline;
 pub mod database;
@@ -48,6 +49,7 @@ pub struct AppState {
     pub postgres: Arc<DatabaseConnection>,
     pub clickhouse: Arc<ClickHouse>,
     pub sync_controller: Arc<SyncController>,
+    pub http_client: Arc<HttpClient>,
 }
 
 pub async fn initialize_system(
@@ -92,6 +94,7 @@ pub async fn initialize_system(
         postgres: database,
         clickhouse: clickhouse_client,
         sync_controller,
+        http_client
     })
 }
 
@@ -100,7 +103,8 @@ pub async fn start_background_services(
     _postgres: Arc<DatabaseConnection>,
     _clickhouse: Arc<ClickHouse>,
     sync_controller: Arc<SyncController>,
-    _cancellation_token: CancellationToken,
+    _http_client: Arc<HttpClient>,
+    _cancellation_token: CancellationToken
 ) -> Result<Vec<tokio::task::JoinHandle<()>>> {
     // 1.启动monitor
     let monitor = {
@@ -146,13 +150,13 @@ pub async fn start_background_services(
 
     // 3.启动对账
     // let reconciliation_server = ReconciliationServer::new(
-    //     postgres.clone(),
-    //     clickhouse_client.clone(),
-    //     http_client.clone()
+    //     _postgres.clone(),
+    //     _clickhouse.clone(),
+    //     _http_client.clone()
     // )?;
     //
     // let reconciliation = {
-    //     let token = cancellation_token.child_token();
+    //     let token = _cancellation_token.child_token();
     //     tokio::spawn(async move {
     //         app_debug!("[-] Starting reconciliation server...");
     //         if let Err(e) = reconciliation_server.start_with_cancellation(token).await {

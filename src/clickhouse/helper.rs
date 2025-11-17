@@ -5,7 +5,7 @@ use std::ops::{Add, Sub};
 use std::fmt;
 use std::str::FromStr;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 pub struct ClickhouseDecimal(i128);
 
 impl ClickhouseDecimal {

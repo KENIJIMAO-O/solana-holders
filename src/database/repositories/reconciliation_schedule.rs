@@ -23,7 +23,7 @@ pub trait ReconciliationScheduleRepository {
     ) -> Result<()>;
 
     /// 查询到期需要对账的 mints
-    async fn get_due_mints(&self) -> Result<Vec<ReconciliationSchedule>>;
+    async fn get_due_mints(&self, limit: i64) -> Result<Vec<ReconciliationSchedule>>;
 
     /// 对账后更新调度信息
     async fn update_schedule_after_reconciliation(
@@ -82,7 +82,7 @@ impl ReconciliationScheduleRepository for DatabaseConnection {
     }
 
     // todo！：感觉这里一下子查所有，有点太多了，对内存来说又是一个不小的压力
-    async fn get_due_mints(&self) -> Result<Vec<ReconciliationSchedule>> {
+    async fn get_due_mints(&self, limit: i64) -> Result<Vec<ReconciliationSchedule>> {
         let records = sqlx::query!(
             r#"
             SELECT
@@ -95,7 +95,9 @@ impl ReconciliationScheduleRepository for DatabaseConnection {
             FROM reconciliation_schedule
             WHERE next_reconciliation_time <= now()
             ORDER BY next_reconciliation_time ASC
+            LIMIT $1
             "#,
+            limit
         )
         .fetch_all(&self.pool)
         .await.map_err(|e| DatabaseError::QueryFailed {

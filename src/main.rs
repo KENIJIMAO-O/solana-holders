@@ -86,6 +86,7 @@ async fn main() {
         app_state.postgres.clone(),
         app_state.clickhouse.clone(),
         app_state.sync_controller.clone(),
+        app_state.http_client.clone(),
         cancellation_token.clone(),
     ).await.unwrap();
 
@@ -132,20 +133,4 @@ async fn main() {
     app_info!("Closing database connection pool...");
     app_state.postgres.pool.close().await;
     app_info!("Database connections closed. Shutdown complete.");
-}
-
-
-/// 打印完整的错误链
-fn print_error_chain(err: &SolanaHoldersError) {
-    app_error!("错误: {}", err);
-
-    // 打印错误源链
-    let mut source = std::error::Error::source(err);
-    let mut indent = 1;
-
-    while let Some(err) = source {
-        app_error!("{:indent$}└─ 原因: {}", "", err, indent = indent * 2);
-        source = std::error::Error::source(err);
-        indent += 1;
-    }
 }

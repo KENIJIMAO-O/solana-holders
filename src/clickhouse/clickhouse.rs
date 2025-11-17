@@ -80,8 +80,6 @@ impl ClickHouse {
             })?;
 
         for event in events {
-            app_info!("Upserted event sig:{:?}", event.tx_sig);
-
             let new_event = Event {
                 slot: event.slot,
                 tx_sig: event.tx_sig.clone(),

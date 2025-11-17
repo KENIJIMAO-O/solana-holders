@@ -9,7 +9,7 @@ use crate::clickhouse::helper::ClickhouseDecimal;
 
 
 // 这是我们准备写入 holders 表的聚合后数据的结构体
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct HolderUpsertData {
     pub mint_pubkey: String,
     pub owner_pubkey: String,
@@ -70,12 +70,11 @@ pub fn aggregate_events(events: &[Event]) -> Vec<HolderUpsertData> {
             .entry((event.mint_pubkey.clone(), event.owner_pubkey.clone()))
             .or_insert((ClickhouseDecimal::from_decimal(Decimal::from(0)), 0));
         
-        // todo!: 注意
         entry.0 = entry.0 + delta;
         entry.1 = entry.1.max(event.slot);
     }
 
-    let results: Vec<HolderUpsertData> = aggregation_map
+    let mut results: Vec<HolderUpsertData> = aggregation_map
         .into_iter()
         .map(|((mint, owner), (delta, lastest_slot))| HolderUpsertData {
             mint_pubkey: mint,
@@ -84,6 +83,9 @@ pub fn aggregate_events(events: &[Event]) -> Vec<HolderUpsertData> {
             last_updated_slot: lastest_slot as i64,
         })
         .collect();
+
+    // 对数据进行排序，防止高并发场景下出现的数据库死锁情况
+    results.sort_unstable();
 
     results
 }
